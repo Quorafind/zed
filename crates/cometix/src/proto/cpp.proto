@@ -166,3 +166,51 @@ message CppConfigResponse {
     string geo_cpp_backend_url = 18;
     bool is_fused_cursor_prediction_model = 20;
 }
+
+// Append completion request/response
+// Used for incremental context synchronization after partial accepts
+message CppAppendRequest {
+    bytes changes = 1;
+}
+
+message CppAppendResponse {
+    bool success = 1;
+}
+
+// File sync error types
+enum FSUploadErrorType {
+    FS_UPLOAD_ERROR_TYPE_UNSPECIFIED = 0;
+    FS_UPLOAD_ERROR_TYPE_NON_EXISTANT = 1;
+    FS_UPLOAD_ERROR_TYPE_HASH_MISMATCH = 2;
+}
+
+enum FSSyncErrorType {
+    FS_SYNC_ERROR_TYPE_UNSPECIFIED = 0;
+    FS_SYNC_ERROR_TYPE_NON_EXISTANT = 1;
+    FS_SYNC_ERROR_TYPE_HASH_MISMATCH = 2;
+}
+
+// File sync request/response
+message FSUploadFileRequest {
+    string uuid = 1;
+    string relative_workspace_path = 2;
+    string contents = 3;
+    int32 model_version = 4;
+    optional string sha256_hash = 5;
+}
+
+message FSUploadFileResponse {
+    FSUploadErrorType error = 1;
+}
+
+message FSSyncFileRequest {
+    string uuid = 1;
+    string relative_workspace_path = 2;
+    int32 model_version = 3;
+    repeated FilesyncUpdateWithModelVersion filesync_updates = 4;
+    string sha256_hash = 5;
+}
+
+message FSSyncFileResponse {
+    FSSyncErrorType error = 1;
+}
