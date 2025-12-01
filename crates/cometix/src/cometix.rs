@@ -5,6 +5,7 @@
 
 mod completion_provider;
 mod diff_tracker;
+mod file_sync;
 
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/aiserver.v1.rs"));
@@ -32,7 +33,7 @@ pub enum EndpointType {
     /// Official Cursor API (api2.cursor.sh) using Connect RPC / gRPC-Web format
     #[default]
     Official,
-    /// Self-hosted cursor-api server using REST format
+    /// Self-hosted server with custom base_url
     Selfhosted,
 }
 
@@ -87,6 +88,38 @@ impl CometixSettings {
         }
     }
 
+    /// Returns the API path for CppAppend based on endpoint type
+    pub fn cpp_append_path(&self) -> &'static str {
+        match self.endpoint_type {
+            EndpointType::Official => "/aiserver.v1.AiService/CppAppend",
+            EndpointType::Selfhosted => "/cpp/append",
+        }
+    }
+
+    /// Returns the API path for CppConfig based on endpoint type
+    pub fn cpp_config_path(&self) -> &'static str {
+        match self.endpoint_type {
+            EndpointType::Official => "/aiserver.v1.AiService/CppConfig",
+            EndpointType::Selfhosted => "/cpp/config",
+        }
+    }
+
+    /// Returns the API path for FSUploadFile based on endpoint type
+    pub fn fs_upload_path(&self) -> &'static str {
+        match self.endpoint_type {
+            EndpointType::Official => "/aiserver.v1.FileSyncService/FSUploadFile",
+            EndpointType::Selfhosted => "/fs/upload",
+        }
+    }
+
+    /// Returns the API path for FSSyncFile based on endpoint type
+    pub fn fs_sync_path(&self) -> &'static str {
+        match self.endpoint_type {
+            EndpointType::Official => "/aiserver.v1.FileSyncService/FSSyncFile",
+            EndpointType::Selfhosted => "/fs/sync",
+        }
+    }
+
     /// Returns the header name for client key based on endpoint type
     pub fn client_key_header(&self) -> &'static str {
         match self.endpoint_type {
@@ -94,11 +127,30 @@ impl CometixSettings {
             EndpointType::Selfhosted => "x-client-key",
         }
     }
+
+    /// Returns true if using Connect RPC protocol (official format)
+    pub fn uses_connect_rpc(&self) -> bool {
+        matches!(self.endpoint_type, EndpointType::Official)
+    }
 }
 
 impl Settings for CometixSettings {
     fn from_settings(content: &SettingsContent) -> Self {
         let cometix = content.cometix.as_ref();
+
+        log::info!(
+            "Cometix: from_settings called, cometix section present: {}",
+            cometix.is_some()
+        );
+
+        if let Some(c) = cometix {
+            log::info!(
+                "Cometix: config values - endpoint_type={:?}, base_url={:?}, auth_token={}",
+                c.endpoint_type,
+                c.base_url,
+                c.auth_token.is_some()
+            );
+        }
 
         let endpoint_type = cometix
             .and_then(|c| c.endpoint_type)
