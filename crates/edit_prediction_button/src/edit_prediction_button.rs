@@ -2,6 +2,7 @@ use anyhow::Result;
 use client::{Client, UserStore, zed_urls};
 use cloud_llm_client::UsageLimit;
 use codestral::CodestralCompletionProvider;
+use cometix::CometixSettings;
 use copilot::{Copilot, Status};
 use editor::{
     Editor, MultiBufferOffset, SelectionEffects, actions::ShowEditPrediction, scroll::Autoscroll,
@@ -455,27 +456,52 @@ impl Render for EditPredictionButton {
 
             EditPredictionProvider::Cometix => {
                 let enabled = self.editor_enabled.unwrap_or(true);
+                let has_auth_token = CometixSettings::get_global(cx).auth_token.is_some();
                 let this = cx.weak_entity();
 
                 div().child(
                     PopoverMenu::new("cometix")
                         .menu(move |window, cx| {
-                            this.update(cx, |this, cx| {
-                                this.build_cometix_context_menu(window, cx)
-                            })
-                            .ok()
+                            this.update(cx, |this, cx| this.build_cometix_context_menu(window, cx))
+                                .ok()
                         })
                         .anchor(Corner::BottomRight)
                         .trigger_with_tooltip(
                             IconButton::new("cometix-icon", IconName::Sparkle)
                                 .shape(IconButtonShape::Square)
-                                .when(!enabled, |this| {
+                                // Show error indicator when auth token is missing
+                                .when(!has_auth_token, |this| {
+                                    this.indicator(Indicator::dot().color(Color::Error))
+                                        .indicator_border_color(Some(
+                                            cx.theme().colors().status_bar_background,
+                                        ))
+                                })
+                                // Show muted indicator when disabled but has token
+                                .when(has_auth_token && !enabled, |this| {
                                     this.indicator(Indicator::dot().color(Color::Ignored))
                                         .indicator_border_color(Some(
                                             cx.theme().colors().status_bar_background,
                                         ))
                                 }),
-                            move |_window, cx| Tooltip::for_action("Cometix", &ToggleMenu, cx),
+                            move |_window, cx| {
+                                if !has_auth_token {
+                                    Tooltip::with_meta(
+                                        "Cometix",
+                                        Some(&ToggleMenu),
+                                        "Auth Token Required",
+                                        cx,
+                                    )
+                                } else if !enabled {
+                                    Tooltip::with_meta(
+                                        "Cometix",
+                                        Some(&ToggleMenu),
+                                        "Disabled For This File",
+                                        cx,
+                                    )
+                                } else {
+                                    Tooltip::for_action("Cometix", &ToggleMenu, cx)
+                                }
+                            },
                         )
                         .with_handle(self.popover_menu_handle.clone()),
                 )
@@ -610,9 +636,32 @@ impl EditPredictionButton {
                         })
                     }
                     EditPredictionProvider::Cometix => {
-                        menu.entry("Cometix", None, move |_, cx| {
-                            set_completion_provider(fs.clone(), cx, provider);
-                        })
+                        let settings = CometixSettings::get_global(cx);
+                        let has_auth_token = settings.auth_token.is_some();
+
+                        // Only Official mode requires auth_token
+                        // Self-hosted modes (Selfhosted/SelfhostedProxy) can work without auth_token
+                        let requires_auth_token =
+                            matches!(settings.endpoint_type, cometix::EndpointType::Official);
+
+                        let entry = ContextMenuEntry::new("Cometix")
+                            .when(requires_auth_token && !has_auth_token, |this| {
+                                this.documentation_aside(
+                                    DocumentationSide::Left,
+                                    DocumentationEdge::Bottom,
+                                    |_| {
+                                        Label::new(
+                                            "Configure auth_token in settings to use Cometix",
+                                        )
+                                        .into_any_element()
+                                    },
+                                )
+                            })
+                            .handler(move |_, cx| {
+                                set_completion_provider(fs.clone(), cx, provider);
+                            });
+
+                        menu.item(entry)
                     }
                     EditPredictionProvider::Experimental(
                         EXPERIMENTAL_SWEEP_EDIT_PREDICTION_PROVIDER_NAME,
@@ -1015,13 +1064,53 @@ impl EditPredictionButton {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ContextMenu> {
+        let settings = CometixSettings::get_global(cx);
+        let has_auth_token = settings.auth_token.is_some();
+        let is_selfhosted = matches!(settings.endpoint_type, cometix::EndpointType::Selfhosted);
+
+        let endpoint_info = match settings.endpoint_type {
+            cometix::EndpointType::Official => "Official API",
+            cometix::EndpointType::Selfhosted => "Self-hosted",
+        };
+
         ContextMenu::build(window, cx, |menu, window, cx| {
-            let menu = self.build_language_settings_menu(menu, window, cx);
-            let menu =
-                self.add_provider_switching_section(menu, EditPredictionProvider::Cometix, cx);
+            let mut menu = self.build_language_settings_menu(menu, window, cx);
+
+            // Show connection status
+            // Self-hosted modes don't require auth_token
+            if has_auth_token || is_selfhosted {
+                menu = menu.separator().header("Connection").item(
+                    ContextMenuEntry::new(endpoint_info)
+                        .disabled(true)
+                        .icon(IconName::Check)
+                        .icon_color(Color::Success)
+                        .icon_size(IconSize::Small),
+                );
+            } else {
+                menu = menu.separator().header("Connection").item(
+                    ContextMenuEntry::new("Auth Token Missing")
+                        .icon(IconName::Warning)
+                        .icon_color(Color::Error)
+                        .icon_size(IconSize::Small)
+                        .handler(move |window, cx| {
+                            window.dispatch_action(
+                                zed_actions::agent::OpenSettings.boxed_clone(),
+                                cx,
+                            );
+                        }),
+                );
+            }
+
+            // Don't show provider switching for self-hosted modes
+            // Users with private deployments have explicit infrastructure choices
+            let menu = if is_selfhosted {
+                menu
+            } else {
+                self.add_provider_switching_section(menu, EditPredictionProvider::Cometix, cx)
+            };
 
             menu.separator()
-                .entry("Configure Cometix Auth Token", None, move |window, cx| {
+                .entry("Configure Cometix Settings", None, move |window, cx| {
                     window.dispatch_action(zed_actions::agent::OpenSettings.boxed_clone(), cx);
                 })
         })
