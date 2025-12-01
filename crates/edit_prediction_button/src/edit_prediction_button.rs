@@ -453,6 +453,34 @@ impl Render for EditPredictionButton {
                 div().child(popover_menu.into_any_element())
             }
 
+            EditPredictionProvider::Cometix => {
+                let enabled = self.editor_enabled.unwrap_or(true);
+                let this = cx.weak_entity();
+
+                div().child(
+                    PopoverMenu::new("cometix")
+                        .menu(move |window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.build_cometix_context_menu(window, cx)
+                            })
+                            .ok()
+                        })
+                        .anchor(Corner::BottomRight)
+                        .trigger_with_tooltip(
+                            IconButton::new("cometix-icon", IconName::Sparkle)
+                                .shape(IconButtonShape::Square)
+                                .when(!enabled, |this| {
+                                    this.indicator(Indicator::dot().color(Color::Ignored))
+                                        .indicator_border_color(Some(
+                                            cx.theme().colors().status_bar_background,
+                                        ))
+                                }),
+                            move |_window, cx| Tooltip::for_action("Cometix", &ToggleMenu, cx),
+                        )
+                        .with_handle(self.popover_menu_handle.clone()),
+                )
+            }
+
             EditPredictionProvider::None => div().hidden(),
         }
     }
@@ -511,6 +539,9 @@ impl EditPredictionButton {
         if CodestralCompletionProvider::has_api_key(cx) {
             providers.push(EditPredictionProvider::Codestral);
         }
+
+        // Cometix is always available (requires auth token in settings)
+        providers.push(EditPredictionProvider::Cometix);
 
         if cx.has_flag::<SweepFeatureFlag>() {
             providers.push(EditPredictionProvider::Experimental(
@@ -575,6 +606,11 @@ impl EditPredictionButton {
                     }
                     EditPredictionProvider::Codestral => {
                         menu.entry("Codestral", None, move |_, cx| {
+                            set_completion_provider(fs.clone(), cx, provider);
+                        })
+                    }
+                    EditPredictionProvider::Cometix => {
+                        menu.entry("Cometix", None, move |_, cx| {
                             set_completion_provider(fs.clone(), cx, provider);
                         })
                     }
@@ -717,6 +753,7 @@ impl EditPredictionButton {
                 | EditPredictionProvider::Copilot
                 | EditPredictionProvider::Supermaven
                 | EditPredictionProvider::Codestral
+                | EditPredictionProvider::Cometix
         ) {
             menu = menu
                 .separator()
@@ -968,6 +1005,23 @@ impl EditPredictionButton {
 
             menu.separator()
                 .entry("Configure Codestral API Key", None, move |window, cx| {
+                    window.dispatch_action(zed_actions::agent::OpenSettings.boxed_clone(), cx);
+                })
+        })
+    }
+
+    fn build_cometix_context_menu(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ContextMenu> {
+        ContextMenu::build(window, cx, |menu, window, cx| {
+            let menu = self.build_language_settings_menu(menu, window, cx);
+            let menu =
+                self.add_provider_switching_section(menu, EditPredictionProvider::Cometix, cx);
+
+            menu.separator()
+                .entry("Configure Cometix Auth Token", None, move |window, cx| {
                     window.dispatch_action(zed_actions::agent::OpenSettings.boxed_clone(), cx);
                 })
         })
