@@ -917,6 +917,7 @@ impl EditPredictionProvider for CometixCompletionProvider {
             .clone()
             .unwrap_or_else(generate_client_key);
         let has_auth_token = settings.auth_token.is_some();
+        let fs_upload_path = settings.fs_upload_path();
 
         // Release immutable borrow before using cx mutably again
         drop(settings);
@@ -984,7 +985,7 @@ impl EditPredictionProvider for CometixCompletionProvider {
             let upload_client_key = client_key.clone();
             let upload_client_key_header = client_key_header.clone();
             let upload_base_url = base_url.clone();
-            let upload_path = settings.fs_upload_path();
+            let upload_path = fs_upload_path;
             let upload_uuid = self.workspace_id.clone();
             let upload_hash = content_hash.clone();
             let upload_sync_manager = file_sync_manager.clone();

@@ -205,7 +205,8 @@ fn assign_edit_prediction_provider(
         }
         EditPredictionProvider::Cometix => {
             let http_client = client.http_client();
-            let provider = cx.new(|_| CometixCompletionProvider::new(http_client));
+            let project = editor.project().cloned();
+            let provider = cx.new(|_| CometixCompletionProvider::new(http_client, project));
             editor.set_edit_prediction_provider(Some(provider), window, cx);
         }
         value @ (EditPredictionProvider::Experimental(_) | EditPredictionProvider::Zed) => {
