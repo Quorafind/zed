@@ -1,6 +1,7 @@
 use client::{Client, UserStore};
 use codestral::CodestralCompletionProvider;
 use collections::HashMap;
+use cometix::CometixCompletionProvider;
 use copilot::{Copilot, CopilotCompletionProvider};
 use editor::Editor;
 use feature_flags::FeatureFlagAppExt;
@@ -200,6 +201,11 @@ fn assign_edit_prediction_provider(
         EditPredictionProvider::Codestral => {
             let http_client = client.http_client();
             let provider = cx.new(|_| CodestralCompletionProvider::new(http_client));
+            editor.set_edit_prediction_provider(Some(provider), window, cx);
+        }
+        EditPredictionProvider::Cometix => {
+            let http_client = client.http_client();
+            let provider = cx.new(|_| CometixCompletionProvider::new(http_client));
             editor.set_edit_prediction_provider(Some(provider), window, cx);
         }
         value @ (EditPredictionProvider::Experimental(_) | EditPredictionProvider::Zed) => {

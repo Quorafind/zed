@@ -1,0 +1,168 @@
+syntax = "proto3";
+package aiserver.v1;
+
+// Core message types for Cometix completion API
+// Simplified version for Zed integration
+
+// Position types
+message CursorPosition {
+    int32 line = 1;
+    int32 column = 2;
+}
+
+message LineRange {
+    int32 start_line_number = 1;
+    int32 end_line_number_inclusive = 2;
+}
+
+message SimpleRange {
+    int32 start_line_number = 1;
+    int32 start_column = 2;
+    int32 end_line_number_inclusive = 3;
+    int32 end_column = 4;
+}
+
+// File info
+message CurrentFileInfo {
+    string relative_workspace_path = 1;
+    string contents = 2;
+    bool rely_on_filesync = 18;
+    optional string sha_256_hash = 17;
+    CursorPosition cursor_position = 3;
+    int32 total_number_of_lines = 8;
+    string language_id = 5;
+    optional int32 file_version = 14;
+    string workspace_root_path = 19;
+    optional string line_ending = 20;
+}
+
+// Diff history
+message CppFileDiffHistory {
+    string file_name = 1;
+    repeated string diff_history = 2;
+    repeated double diff_history_timestamps = 3;
+}
+
+// Intent info
+message CppIntentInfo {
+    string source = 1;
+}
+
+// Additional file context
+message AdditionalFile {
+    string relative_workspace_path = 1;
+    bool is_open = 2;
+    repeated string visible_range_content = 3;
+    optional double last_viewed_at = 4;
+    repeated int32 start_line_number_one_indexed = 5;
+    repeated LineRange visible_ranges = 6;
+}
+
+// Filesync update
+message FilesyncUpdateWithModelVersion {
+    int32 model_version = 1;
+    string relative_workspace_path = 2;
+    repeated SingleUpdateRequest updates = 3;
+    int32 expected_file_length = 4;
+}
+
+message SingleUpdateRequest {
+    int32 start_position = 1;
+    int32 end_position = 2;
+    int32 change_length = 3;
+    string replaced_string = 4;
+    SimpleRange range = 5;
+}
+
+// Main request message
+message StreamCppRequest {
+    enum ControlToken {
+        CONTROL_TOKEN_UNSPECIFIED = 0;
+        CONTROL_TOKEN_QUIET = 1;
+        CONTROL_TOKEN_LOUD = 2;
+        CONTROL_TOKEN_OP = 3;
+    }
+
+    CurrentFileInfo current_file = 1;
+    repeated string diff_history = 2;
+    optional string model_name = 3;
+    repeated CppFileDiffHistory file_diff_histories = 7;
+    optional bool immediately_ack = 12;
+    optional bool enable_more_context = 17;
+    optional CppIntentInfo cpp_intent_info = 16;
+    optional string workspace_id = 18;
+    repeated AdditionalFile additional_files = 19;
+    optional ControlToken control_token = 20;
+    optional double client_time = 21;
+    repeated FilesyncUpdateWithModelVersion filesync_updates = 22;
+    double time_since_request_start = 23;
+    double time_at_request_send = 24;
+    optional double client_timezone_offset = 25;
+    optional bool supports_cpt = 27;
+    optional bool supports_crlf_cpt = 28;
+}
+
+// Main response message
+message StreamCppResponse {
+    message CursorPredictionTarget {
+        string relative_path = 1;
+        int32 line_number_one_indexed = 2;
+        string expected_content = 3;
+        bool should_retrigger_cpp = 4;
+    }
+
+    message ModelInfo {
+        bool is_fused_cursor_prediction_model = 1;
+        bool is_multidiff_model = 2;
+    }
+
+    string text = 1;
+    optional int32 suggestion_start_line = 2;
+    optional int32 suggestion_confidence = 3;
+    optional bool done_stream = 4;
+    optional string debug_model_output = 5;
+    optional LineRange range_to_replace = 11;
+    optional CursorPredictionTarget cursor_prediction_target = 12;
+    optional bool done_edit = 13;
+    optional ModelInfo model_info = 14;
+    optional bool begin_edit = 15;
+    optional bool should_remove_leading_eol = 16;
+    optional string binding_id = 17;
+}
+
+// Fate recording (for telemetry)
+enum CppFate {
+    CPP_FATE_UNSPECIFIED = 0;
+    CPP_FATE_ACCEPT = 1;
+    CPP_FATE_REJECT = 2;
+    CPP_FATE_PARTIAL_ACCEPT = 3;
+}
+
+message RecordCppFateRequest {
+    string request_id = 1;
+    float performance_now_time = 2;
+    CppFate fate = 3;
+    string extension = 4;
+}
+
+message RecordCppFateResponse {
+}
+
+// Config request/response
+message CppConfigRequest {
+    optional bool is_nightly = 1;
+    string model = 2;
+    optional bool supports_cpt = 3;
+}
+
+message CppConfigResponse {
+    optional int32 above_radius = 1;
+    optional int32 below_radius = 2;
+    optional bool is_on = 5;
+    optional bool is_ghost_text = 6;
+    int32 global_debounce_duration_millis = 11;
+    int32 client_debounce_duration_millis = 12;
+    string cpp_url = 13;
+    string geo_cpp_backend_url = 18;
+    bool is_fused_cursor_prediction_model = 20;
+}

@@ -3,11 +3,11 @@ use std::num::NonZeroU32;
 use collections::{HashMap, HashSet};
 use gpui::{Modifiers, SharedString};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize, de::Error as _};
-use settings_macros::{MergeFrom, with_fallible_options};
+use serde::{de::Error as _, Deserialize, Serialize};
+use settings_macros::{with_fallible_options, MergeFrom};
 use std::sync::Arc;
 
-use crate::{ExtendingVec, merge_from};
+use crate::{merge_from, ExtendingVec};
 
 #[with_fallible_options]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -74,6 +74,7 @@ pub enum EditPredictionProvider {
     Supermaven,
     Zed,
     Codestral,
+    Cometix,
     Experimental(&'static str),
 }
 
@@ -93,6 +94,7 @@ impl<'de> Deserialize<'de> for EditPredictionProvider {
             Supermaven,
             Zed,
             Codestral,
+            Cometix,
             Experimental(String),
         }
 
@@ -102,6 +104,7 @@ impl<'de> Deserialize<'de> for EditPredictionProvider {
             Content::Supermaven => EditPredictionProvider::Supermaven,
             Content::Zed => EditPredictionProvider::Zed,
             Content::Codestral => EditPredictionProvider::Codestral,
+            Content::Cometix => EditPredictionProvider::Cometix,
             Content::Experimental(name)
                 if name == EXPERIMENTAL_SWEEP_EDIT_PREDICTION_PROVIDER_NAME =>
             {
@@ -134,6 +137,7 @@ impl EditPredictionProvider {
             | EditPredictionProvider::Copilot
             | EditPredictionProvider::Supermaven
             | EditPredictionProvider::Codestral
+            | EditPredictionProvider::Cometix
             | EditPredictionProvider::Experimental(_) => false,
         }
     }
@@ -918,7 +922,7 @@ pub enum IndentGuideBackgroundColoring {
 #[cfg(test)]
 mod test {
 
-    use crate::{ParseStatus, fallible_options};
+    use crate::{fallible_options, ParseStatus};
 
     use super::*;
 
@@ -988,19 +992,15 @@ mod test {
         let raw_prettier = r#"{"allowed": false, "tabWidth": 4, "semi": false}"#;
         let result = serde_json::from_str::<PrettierSettingsContent>(raw_prettier)
             .expect("Failed to parse prettier options");
-        assert!(
-            result
-                .options
-                .as_ref()
-                .expect("options were flattened")
-                .contains_key("semi")
-        );
-        assert!(
-            result
-                .options
-                .as_ref()
-                .expect("options were flattened")
-                .contains_key("tabWidth")
-        );
+        assert!(result
+            .options
+            .as_ref()
+            .expect("options were flattened")
+            .contains_key("semi"));
+        assert!(result
+            .options
+            .as_ref()
+            .expect("options were flattened")
+            .contains_key("tabWidth"));
     }
 }

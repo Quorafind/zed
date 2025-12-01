@@ -160,6 +160,59 @@ pub struct SettingsContent {
 
     /// Settings related to Vim mode in Zed.
     pub vim: Option<VimSettingsContent>,
+
+    /// Settings for Cometix (Cursor AI) edit predictions.
+    pub cometix: Option<CometixSettingsContent>,
+}
+
+/// Settings for Cometix (Cursor AI) completion provider.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct CometixSettingsContent {
+    /// Whether Cometix is enabled.
+    ///
+    /// Default: true (when auth_token is configured)
+    pub enabled: Option<bool>,
+    /// The authentication token for the Cursor API.
+    /// Required for Cometix to function.
+    pub auth_token: Option<String>,
+    /// The base URL for the API.
+    ///
+    /// Default: https://api2.cursor.sh
+    pub base_url: Option<String>,
+    /// The client key for checksum validation.
+    /// Uses the format: base64(sha256(machineId)):base64(sha256(machineId + salt))
+    /// If not provided, a random key will be generated.
+    pub client_key: Option<String>,
+    /// The endpoint type: "official" for api2.cursor.sh or "selfhosted" for custom servers.
+    ///
+    /// Default: official
+    pub endpoint_type: Option<CometixEndpointType>,
+    /// The model to use for completions.
+    ///
+    /// Default: auto
+    pub model: Option<String>,
+    /// Debounce delay in milliseconds before triggering completion requests.
+    ///
+    /// Default: 75
+    pub debounce_ms: Option<u64>,
+    /// Maximum length of completion text to accept.
+    ///
+    /// Default: 2000
+    pub max_completion_length: Option<u32>,
+}
+
+/// The type of endpoint to use for Cometix API calls.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum CometixEndpointType {
+    /// Official Cursor API (api2.cursor.sh) using Connect RPC format.
+    #[default]
+    Official,
+    /// Self-hosted cursor-api server using REST format.
+    Selfhosted,
 }
 
 impl SettingsContent {
