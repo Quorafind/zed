@@ -20,9 +20,10 @@ use crate::CometixSettings;
 use crate::diff_tracker::DiffTracker;
 use crate::file_sync::FileSyncManager;
 use crate::proto::{
-    AdditionalFile, CppAppendRequest, CppConfigRequest, CppConfigResponse, CppFate, CppIntentInfo,
-    CurrentFileInfo, CursorPosition, FilesyncUpdateWithModelVersion, FsUploadErrorType,
-    RecordCppFateRequest, StreamCppRequest, StreamCppResponse,
+    AdditionalFile, CppAppendRequest, CppConfigRequest, CppConfigResponse, CppContextItem, CppFate,
+    CppFileDiffHistory, CppIntentInfo, CurrentFileInfo, CursorPosition,
+    FilesyncUpdateWithModelVersion, FsUploadErrorType, RecordCppFateRequest, StreamCppRequest,
+    StreamCppResponse,
 };
 use project::Project;
 
@@ -63,20 +64,26 @@ pub struct CometixCompletionProvider {
     pending_refresh: Option<Task<Result<()>>>,
     current_completion: Option<CompletionState>,
     workspace_id: String,
+    /// FileSync client key (64-char hex) - used for x-client-key and x-fs-client-key headers
+    filesync_client_key: String,
+    /// FileSync cookie value (32-char hex) - used for FilesyncCookie header
+    filesync_cookie: String,
 }
 
 struct CompletionState {
     text: String,
     binding_id: Option<String>,
+    #[allow(dead_code)]
     range_start: Anchor,
+    #[allow(dead_code)]
     range_end: Anchor,
-    /// Original 1-based line range from API response (for debugging)
     #[allow(dead_code)]
     api_range: Option<(i32, i32)>,
 }
 
 impl CometixCompletionProvider {
     pub fn new(http_client: Arc<dyn HttpClient>, project: Option<Entity<Project>>) -> Self {
+        // Generate workspace_id - will be updated when we have project context
         let workspace_id = generate_workspace_id();
         Self {
             http_client: http_client.clone(),
@@ -90,6 +97,29 @@ impl CometixCompletionProvider {
             pending_refresh: None,
             current_completion: None,
             workspace_id,
+            filesync_client_key: generate_filesync_client_key(),
+            filesync_cookie: generate_filesync_cookie(),
+        }
+    }
+
+    /// Update workspace_id based on actual workspace path for stability
+    fn ensure_stable_workspace_id(&mut self, cx: &App) {
+        if let Some(project) = &self.project {
+            let project = project.read(cx);
+            if let Some(worktree) = project.worktrees(cx).next() {
+                let worktree = worktree.read(cx);
+                let root_path = worktree.abs_path().to_string_lossy().to_string();
+                let stable_id = generate_stable_workspace_id(&root_path);
+                if self.workspace_id != stable_id {
+                    log::info!(
+                        "Cometix: Updating workspace_id from {} to {} (path: {})",
+                        self.workspace_id,
+                        stable_id,
+                        root_path
+                    );
+                    self.workspace_id = stable_id;
+                }
+            }
         }
     }
 
@@ -159,6 +189,8 @@ impl CometixCompletionProvider {
         auth_token: String,
         client_key: String,
         client_key_header: String,
+        filesync_client_key: String,
+        filesync_cookie: String,
         base_url: String,
         stream_path: &'static str,
         uses_connect_rpc: bool,
@@ -203,6 +235,9 @@ impl CometixCompletionProvider {
             .header("Connect-Protocol-Version", "1")
             .header("Authorization", format!("Bearer {}", auth_token))
             .header(&client_key_header, &client_key)
+            .header("x-client-key", &filesync_client_key)
+            .header("x-fs-client-key", &filesync_client_key)
+            .header("Cookie", format!("FilesyncCookie={}", filesync_cookie))
             .header("x-cursor-client-version", CLIENT_VERSION)
             .header("User-Agent", "connectrpc/1.6.1")
             .body(AsyncBody::from(body))?;
@@ -218,6 +253,16 @@ impl CometixCompletionProvider {
         let status = response.status();
 
         log::info!("Cometix: Response status: {}", status);
+
+        // Handle 204 No Content - server has no suggestion
+        if status.as_u16() == 204 {
+            log::info!(
+                "Cometix: Server returned 204 No Content - no completion suggestion available. \
+                This is normal when: (1) input is too short, (2) cursor position doesn't need completion, \
+                (3) server is rate limiting, or (4) model decided no suggestion is appropriate."
+            );
+            return Ok(StreamCppResponse::default());
+        }
 
         // Read entire response body for LPM parsing
         let mut body_bytes = Vec::new();
@@ -761,10 +806,19 @@ impl CometixCompletionProvider {
     /// Note: True MRU ordering would require tracking buffer access times
     /// at the Workspace/Pane level, which is not currently accessible here.
     /// We use a heuristic that prioritizes same-language files instead.
-    fn collect_additional_files(&self, current_file_path: &str, cx: &App) -> Vec<AdditionalFile> {
+    /// Collects additional files and context items from the project for context.
+    ///
+    /// Returns a tuple of (additional_files, context_items):
+    /// - additional_files: Used for session state tracking
+    /// - context_items: Used for RAG-based code context (primary source for model)
+    fn collect_additional_files(
+        &self,
+        current_file_path: &str,
+        cx: &App,
+    ) -> (Vec<AdditionalFile>, Vec<CppContextItem>) {
         let Some(project) = &self.project else {
             log::debug!("Cometix: No project available for additional files");
-            return vec![];
+            return (vec![], vec![]);
         };
 
         let project = project.read(cx);
@@ -776,8 +830,13 @@ impl CometixCompletionProvider {
             .map(|s| s.to_lowercase());
 
         // Collect candidate files, separated by language match
-        let mut same_lang_files = Vec::new();
-        let mut other_files = Vec::new();
+        let mut same_lang_files: Vec<(AdditionalFile, CppContextItem)> = Vec::new();
+        let mut other_files: Vec<(AdditionalFile, CppContextItem)> = Vec::new();
+
+        let now_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
 
         for buffer in project.opened_buffers(cx) {
             let buffer = buffer.read(cx);
@@ -816,9 +875,8 @@ impl CometixCompletionProvider {
                 relative_workspace_path: file_path.clone(),
                 is_open: true,
                 visible_range_content: lines,
-                // Note: We don't have true last_viewed_at time available here.
-                // Setting to None as we cannot accurately track MRU at this level.
-                last_viewed_at: None,
+                // Use current timestamp for last_viewed_at since file is currently open
+                last_viewed_at: Some(now_timestamp),
                 start_line_number_one_indexed: vec![1],
                 visible_ranges: vec![crate::proto::LineRange {
                     start_line_number: 1,
@@ -826,28 +884,39 @@ impl CometixCompletionProvider {
                 }],
             };
 
+            // Build context item for RAG context
+            let context_item = CppContextItem {
+                contents: content,
+                symbol: None,
+                relative_workspace_path: file_path.clone(),
+                score: 1.0, // Default score
+            };
+
             // Prioritize files with the same extension
             let file_ext = file_path.rsplit('.').next().map(|s| s.to_lowercase());
             if file_ext == current_ext {
-                same_lang_files.push(additional_file);
+                same_lang_files.push((additional_file, context_item));
             } else {
-                other_files.push(additional_file);
+                other_files.push((additional_file, context_item));
             }
         }
 
         // Combine: same-language files first, then others
-        let mut additional_files = same_lang_files;
-        additional_files.extend(other_files);
+        let mut combined = same_lang_files;
+        combined.extend(other_files);
 
         // Limit to MAX_ADDITIONAL_FILES
-        additional_files.truncate(MAX_ADDITIONAL_FILES);
+        combined.truncate(MAX_ADDITIONAL_FILES);
 
         log::info!(
-            "Cometix: Collected {} additional files for context",
-            additional_files.len()
+            "Cometix: Collected {} additional files and context items",
+            combined.len()
         );
 
-        additional_files
+        // Split into separate vectors
+        let (additional_files, context_items): (Vec<_>, Vec<_>) = combined.into_iter().unzip();
+
+        (additional_files, context_items)
     }
 }
 
@@ -891,6 +960,9 @@ impl EditPredictionProvider for CometixCompletionProvider {
         // Cancel any pending refresh
         self.pending_refresh = None;
         self.current_completion = None;
+
+        // Ensure we have a stable workspace_id based on project path
+        self.ensure_stable_workspace_id(cx);
 
         let settings = CometixSettings::get_global(cx);
 
@@ -956,8 +1028,8 @@ impl EditPredictionProvider for CometixCompletionProvider {
         self.file_extension = file_path.rsplit('.').next().map(|s| s.to_string());
         self.current_file_path = Some(file_path.clone());
 
-        // Collect additional files for multi-file context
-        let additional_files = self.collect_additional_files(&file_path, cx);
+        // Collect additional files and context items for multi-file context
+        let (additional_files, context_items) = self.collect_additional_files(&file_path, cx);
 
         // Build diff history
         let diff_history = {
@@ -984,6 +1056,8 @@ impl EditPredictionProvider for CometixCompletionProvider {
             let upload_auth_token = auth_token.clone();
             let upload_client_key = client_key.clone();
             let upload_client_key_header = client_key_header.clone();
+            let upload_filesync_client_key = self.filesync_client_key.clone();
+            let upload_filesync_cookie = self.filesync_cookie.clone();
             let upload_base_url = base_url.clone();
             let upload_path = fs_upload_path;
             let upload_uuid = self.workspace_id.clone();
@@ -1001,6 +1075,8 @@ impl EditPredictionProvider for CometixCompletionProvider {
                     upload_auth_token,
                     upload_client_key,
                     upload_client_key_header,
+                    upload_filesync_client_key,
+                    upload_filesync_cookie,
                     upload_base_url,
                     upload_path,
                 )
@@ -1038,8 +1114,12 @@ impl EditPredictionProvider for CometixCompletionProvider {
             }]
         };
 
-        // Determine if we can rely on filesync (file has been uploaded and no pending updates)
-        let rely_on_filesync = !needs_upload && filesync_updates.is_empty();
+        // Force rely_on_filesync to false.
+        // Since we haven't hooked edit events to call record_change,
+        // the incremental update list is always empty. If we don't force this to false,
+        // the client will incorrectly tell the server to use a stale cached version,
+        // causing cursor position mismatch or context loss, resulting in 204 responses.
+        let rely_on_filesync = false;
 
         log::info!(
             "Cometix: File sync status - needs_upload={}, rely_on_filesync={}, pending_updates={}",
@@ -1081,13 +1161,30 @@ impl EditPredictionProvider for CometixCompletionProvider {
                 workspace_root_path: String::new(),
                 line_ending: Some("\n".to_string()),
             }),
-            diff_history: if diff_history.is_empty() {
+            // Note: diff_history field is deprecated, use file_diff_histories instead
+            diff_history: vec![],
+            model_name: Some(model_name),
+            // Build proper CppFileDiffHistory structure with file name
+            file_diff_histories: if diff_history.is_empty() {
                 vec![]
             } else {
-                vec![diff_history]
+                let file_name = file_path
+                    .rsplit('/')
+                    .next()
+                    .or_else(|| file_path.rsplit('\\').next())
+                    .unwrap_or(&file_path)
+                    .to_string();
+                vec![CppFileDiffHistory {
+                    file_name,
+                    diff_history: vec![diff_history],
+                    diff_history_timestamps: vec![
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs_f64())
+                            .unwrap_or(0.0),
+                    ],
+                }]
             },
-            model_name: Some(model_name),
-            file_diff_histories: vec![],
             immediately_ack: Some(false),
             enable_more_context: Some(true),
             cpp_intent_info: Some(CppIntentInfo {
@@ -1095,6 +1192,7 @@ impl EditPredictionProvider for CometixCompletionProvider {
             }),
             workspace_id: Some(self.workspace_id.clone()),
             additional_files,
+            context_items,
             control_token: None,
             client_time: Some(
                 std::time::SystemTime::now()
@@ -1111,6 +1209,8 @@ impl EditPredictionProvider for CometixCompletionProvider {
         };
 
         let http_client = self.http_client.clone();
+        let filesync_client_key = self.filesync_client_key.clone();
+        let filesync_cookie = self.filesync_cookie.clone();
 
         self.pending_refresh = Some(cx.spawn(async move |this, cx| {
             if debounce {
@@ -1123,6 +1223,8 @@ impl EditPredictionProvider for CometixCompletionProvider {
                 auth_token,
                 client_key,
                 client_key_header,
+                filesync_client_key,
+                filesync_cookie,
                 base_url,
                 stream_path,
                 uses_connect_rpc,
@@ -1331,6 +1433,10 @@ fn common_prefix<T1: Iterator<Item = char>, T2: Iterator<Item = char>>(a: T1, b:
 }
 
 /// Generate a workspace ID for the session
+/// Generate a stable workspace ID based on workspace path
+///
+/// If no path is provided, falls back to a random ID.
+/// The format follows Cursor's convention: "a-b-c-d-e-f-g" (7 lowercase letters separated by dashes)
 fn generate_workspace_id() -> String {
     use rand::Rng;
     let mut rng = rand::rng();
@@ -1341,10 +1447,130 @@ fn generate_workspace_id() -> String {
         .collect()
 }
 
-/// Generate a client key for checksum validation
+/// Generate a stable workspace ID from a workspace path
+///
+/// Uses SHA256 hash of the path to generate a deterministic ID.
+/// This ensures the same workspace always gets the same ID, which is
+/// important for file sync state consistency with the server.
+fn generate_stable_workspace_id(workspace_path: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(workspace_path.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+
+    // Convert hash to 7 lowercase letters (a-z) separated by dashes
+    // Take pairs of hex digits and convert to letters
+    let letters: Vec<char> = hash
+        .as_bytes()
+        .chunks(2)
+        .take(7)
+        .map(|chunk| {
+            let hex_str = std::str::from_utf8(chunk).unwrap_or("00");
+            let val = u8::from_str_radix(hex_str, 16).unwrap_or(0);
+            (b'a' + (val % 26)) as char
+        })
+        .collect();
+
+    letters
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Generate a cursor checksum for x-cursor-checksum header validation
+///
+/// Format: timestamp_header(8) + device_hash(64) + '/' + mac_hash(64) = 137 chars
+/// - timestamp_header: 6-byte obfuscated timestamp, Base64 encoded to 8 chars
+/// - device_hash: 32-byte random value, hex encoded to 64 chars
+/// - mac_hash: 32-byte random value, hex encoded to 64 chars
 fn generate_client_key() -> String {
     use rand::Rng;
     let mut rng = rand::rng();
+
+    // 1. Generate timestamp header (8 chars)
+    let timestamp_header = generate_timestamp_header();
+
+    // 2. Generate device hash (64 hex chars)
+    let device_bytes: Vec<u8> = (0..32).map(|_| rng.random()).collect();
+    let device_hash = hex::encode(device_bytes);
+
+    // 3. Generate MAC hash (64 hex chars)
+    let mac_bytes: Vec<u8> = (0..32).map(|_| rng.random()).collect();
+    let mac_hash = hex::encode(mac_bytes);
+
+    format!("{}{}/{}", timestamp_header, device_hash, mac_hash)
+}
+
+/// Generate an obfuscated timestamp header (8 chars)
+///
+/// Uses a custom obfuscation algorithm matching Cursor's implementation.
+fn generate_timestamp_header() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Build 6-byte array from timestamp
+    let mut bytes = vec![0u8; 6];
+    bytes[0] = ((now >> 8) & 0xFF) as u8;
+    bytes[1] = (now & 0xFF) as u8;
+    bytes[2] = ((now >> 24) & 0xFF) as u8;
+    bytes[3] = ((now >> 16) & 0xFF) as u8;
+    bytes[4] = ((now >> 8) & 0xFF) as u8;
+    bytes[5] = (now & 0xFF) as u8;
+
+    // Obfuscation algorithm
+    let mut prev: u8 = 165;
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = ((*byte ^ prev).wrapping_add(i as u8)) & 0xFF;
+        prev = *byte;
+    }
+
+    encode_base64_url_safe(&bytes)
+}
+
+/// URL-safe Base64 encoding without padding
+fn encode_base64_url_safe(input: &[u8]) -> String {
+    const B64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    let mut result = String::new();
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+
+        result.push(B64_CHARS[(b0 >> 2) as usize] as char);
+        result.push(B64_CHARS[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(B64_CHARS[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            result.push(B64_CHARS[(b2 & 0x3F) as usize] as char);
+        }
+    }
+    result
+}
+
+/// Generate a FileSync client key (64-char hex)
+///
+/// Used for x-client-key and x-fs-client-key headers in FileSync requests.
+fn generate_filesync_client_key() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
     let random_bytes: Vec<u8> = (0..32).map(|_| rng.random()).collect();
+    hex::encode(random_bytes)
+}
+
+/// Generate a FileSync cookie value (32-char hex)
+///
+/// Used for FilesyncCookie header in FileSync requests.
+fn generate_filesync_cookie() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let random_bytes: Vec<u8> = (0..16).map(|_| rng.random()).collect();
     hex::encode(random_bytes)
 }

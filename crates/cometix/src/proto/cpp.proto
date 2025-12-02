@@ -58,6 +58,14 @@ message AdditionalFile {
     repeated LineRange visible_ranges = 6;
 }
 
+// Context item for RAG-based code context
+message CppContextItem {
+    string contents = 1;
+    optional string symbol = 2;
+    string relative_workspace_path = 3;
+    float score = 4;
+}
+
 // Filesync update
 message FilesyncUpdateWithModelVersion {
     int32 model_version = 1;
@@ -88,6 +96,7 @@ message StreamCppRequest {
     optional string model_name = 3;
     repeated CppFileDiffHistory file_diff_histories = 7;
     optional bool immediately_ack = 12;
+    repeated CppContextItem context_items = 13;
     optional bool enable_more_context = 17;
     optional CppIntentInfo cpp_intent_info = 16;
     optional string workspace_id = 18;

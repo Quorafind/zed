@@ -33,7 +33,9 @@ pub enum EndpointType {
     /// Official Cursor API (api2.cursor.sh) using Connect RPC / gRPC-Web format
     #[default]
     Official,
-    /// Self-hosted server with custom base_url
+    /// Proxy server that forwards to official API (uses official paths with custom base_url)
+    SelfhostedProxy,
+    /// Self-hosted server with simplified API paths (e.g., cursor-api project)
     Selfhosted,
 }
 
@@ -68,69 +70,54 @@ impl CometixSettings {
         }
         match self.endpoint_type {
             EndpointType::Official => DEFAULT_API_URL,
-            EndpointType::Selfhosted => DEFAULT_SELFHOSTED_URL,
+            EndpointType::SelfhostedProxy | EndpointType::Selfhosted => DEFAULT_SELFHOSTED_URL,
         }
     }
 
-    /// Returns the API path for streaming completions based on endpoint type
+    /// Returns the API path for streaming completions
     pub fn stream_cpp_path(&self) -> &'static str {
-        match self.endpoint_type {
-            EndpointType::Official => "/aiserver.v1.AiService/StreamCpp",
-            EndpointType::Selfhosted => "/cpp/stream",
-        }
+        "/aiserver.v1.AiService/StreamCpp"
     }
 
-    /// Returns the API path for recording fate based on endpoint type
+    /// Returns the API path for recording fate
     pub fn record_fate_path(&self) -> &'static str {
-        match self.endpoint_type {
-            EndpointType::Official => "/aiserver.v1.AiService/RecordCppFate",
-            EndpointType::Selfhosted => "/cpp/fate",
-        }
+        "/aiserver.v1.AiService/RecordCppFate"
     }
 
-    /// Returns the API path for CppAppend based on endpoint type
+    /// Returns the API path for CppAppend
     pub fn cpp_append_path(&self) -> &'static str {
-        match self.endpoint_type {
-            EndpointType::Official => "/aiserver.v1.AiService/CppAppend",
-            EndpointType::Selfhosted => "/cpp/append",
-        }
+        "/aiserver.v1.AiService/CppAppend"
     }
 
-    /// Returns the API path for CppConfig based on endpoint type
+    /// Returns the API path for CppConfig
     pub fn cpp_config_path(&self) -> &'static str {
-        match self.endpoint_type {
-            EndpointType::Official => "/aiserver.v1.AiService/CppConfig",
-            EndpointType::Selfhosted => "/cpp/config",
-        }
+        "/aiserver.v1.AiService/CppConfig"
     }
 
-    /// Returns the API path for FSUploadFile based on endpoint type
+    /// Returns the API path for FSUploadFile
     pub fn fs_upload_path(&self) -> &'static str {
-        match self.endpoint_type {
-            EndpointType::Official => "/aiserver.v1.FileSyncService/FSUploadFile",
-            EndpointType::Selfhosted => "/fs/upload",
-        }
+        "/aiserver.v1.FileSyncService/FSUploadFile"
     }
 
-    /// Returns the API path for FSSyncFile based on endpoint type
+    /// Returns the API path for FSSyncFile
     pub fn fs_sync_path(&self) -> &'static str {
-        match self.endpoint_type {
-            EndpointType::Official => "/aiserver.v1.FileSyncService/FSSyncFile",
-            EndpointType::Selfhosted => "/fs/sync",
-        }
+        "/aiserver.v1.FileSyncService/FSSyncFile"
     }
 
-    /// Returns the header name for client key based on endpoint type
+    /// Returns the header name for client key
     pub fn client_key_header(&self) -> &'static str {
-        match self.endpoint_type {
-            EndpointType::Official => "x-cursor-checksum",
-            EndpointType::Selfhosted => "x-client-key",
-        }
+        "x-cursor-checksum"
     }
 
     /// Returns true if using Connect RPC protocol (official format)
+    ///
+    /// Note: Most self-hosted cursor-api servers also expect Connect RPC format
+    /// (5-byte envelope header + protobuf payload), so we always return true.
+    /// If you have a server that expects raw proto, you may need to add a config option.
     pub fn uses_connect_rpc(&self) -> bool {
-        matches!(self.endpoint_type, EndpointType::Official)
+        // Always use Connect RPC format - most servers (including self-hosted)
+        // expect the standard Connect protocol with envelope headers
+        true
     }
 }
 
@@ -156,6 +143,7 @@ impl Settings for CometixSettings {
             .and_then(|c| c.endpoint_type)
             .map(|e| match e {
                 settings::CometixEndpointType::Official => EndpointType::Official,
+                settings::CometixEndpointType::SelfhostedProxy => EndpointType::SelfhostedProxy,
                 settings::CometixEndpointType::Selfhosted => EndpointType::Selfhosted,
             })
             .unwrap_or_default();

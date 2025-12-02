@@ -211,7 +211,9 @@ pub enum CometixEndpointType {
     /// Official Cursor API (api2.cursor.sh) using Connect RPC format.
     #[default]
     Official,
-    /// Self-hosted server with custom base_url.
+    /// Proxy server that forwards to official API (uses official paths with custom base_url).
+    SelfhostedProxy,
+    /// Self-hosted server with simplified API paths (e.g., cursor-api project).
     Selfhosted,
 }
 

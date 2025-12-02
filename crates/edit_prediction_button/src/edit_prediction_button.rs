@@ -1066,10 +1066,14 @@ impl EditPredictionButton {
     ) -> Entity<ContextMenu> {
         let settings = CometixSettings::get_global(cx);
         let has_auth_token = settings.auth_token.is_some();
-        let is_selfhosted = matches!(settings.endpoint_type, cometix::EndpointType::Selfhosted);
+        let is_selfhosted = matches!(
+            settings.endpoint_type,
+            cometix::EndpointType::Selfhosted | cometix::EndpointType::SelfhostedProxy
+        );
 
         let endpoint_info = match settings.endpoint_type {
             cometix::EndpointType::Official => "Official API",
+            cometix::EndpointType::SelfhostedProxy => "Self-hosted Proxy",
             cometix::EndpointType::Selfhosted => "Self-hosted",
         };
 

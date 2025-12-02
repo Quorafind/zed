@@ -41,8 +41,10 @@ struct FileSyncState {
 ///
 /// Handles uploading and incrementally syncing files with the Cursor API server.
 pub struct FileSyncManager {
+    #[allow(dead_code)]
     http_client: Arc<dyn HttpClient>,
     file_states: Arc<Mutex<HashMap<String, FileSyncState>>>,
+    #[allow(dead_code)]
     workspace_uuid: String,
 }
 
@@ -73,6 +75,8 @@ impl FileSyncManager {
         auth_token: String,
         client_key: String,
         client_key_header: String,
+        filesync_client_key: String,
+        filesync_cookie: String,
         base_url: String,
         upload_path: &'static str,
     ) -> Result<FsUploadErrorType> {
@@ -113,6 +117,9 @@ impl FileSyncManager {
             .header("Content-Type", "application/proto")
             .header("Authorization", format!("Bearer {}", auth_token))
             .header(&client_key_header, &client_key)
+            .header("x-client-key", &filesync_client_key)
+            .header("x-fs-client-key", &filesync_client_key)
+            .header("Cookie", format!("FilesyncCookie={}", filesync_cookie))
             .header("x-cursor-client-version", CLIENT_VERSION)
             .body(AsyncBody::from(body))?;
 
@@ -144,6 +151,7 @@ impl FileSyncManager {
     }
 
     /// Syncs incremental changes to a file
+    #[allow(dead_code)]
     pub async fn sync_file(
         http_client: Arc<dyn HttpClient>,
         uuid: String,
@@ -154,6 +162,8 @@ impl FileSyncManager {
         auth_token: String,
         client_key: String,
         client_key_header: String,
+        filesync_client_key: String,
+        filesync_cookie: String,
         base_url: String,
         sync_path: &'static str,
     ) -> Result<FsSyncErrorType> {
@@ -183,6 +193,9 @@ impl FileSyncManager {
             .header("Content-Type", "application/proto")
             .header("Authorization", format!("Bearer {}", auth_token))
             .header(&client_key_header, &client_key)
+            .header("x-client-key", &filesync_client_key)
+            .header("x-fs-client-key", &filesync_client_key)
+            .header("Cookie", format!("FilesyncCookie={}", filesync_cookie))
             .header("x-cursor-client-version", CLIENT_VERSION)
             .body(AsyncBody::from(body))?;
 
@@ -217,6 +230,7 @@ impl FileSyncManager {
     }
 
     /// Records a text change for incremental sync
+    #[allow(dead_code)]
     pub fn record_change(
         &self,
         file_path: &str,
@@ -292,6 +306,7 @@ impl FileSyncManager {
     }
 
     /// Clears sync state for a file
+    #[allow(dead_code)]
     pub fn clear_file(&self, file_path: &str) {
         self.file_states.lock().remove(file_path);
     }

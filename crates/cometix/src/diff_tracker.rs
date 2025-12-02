@@ -93,6 +93,7 @@ impl DiffTracker {
     }
 
     /// Get all recent diffs for a file
+    #[allow(dead_code)]
     pub fn get_recent_diffs(&self, file_path: &str) -> Vec<String> {
         self.file_states
             .get(file_path)
@@ -101,11 +102,13 @@ impl DiffTracker {
     }
 
     /// Clear tracking state for a file
+    #[allow(dead_code)]
     pub fn clear_file(&mut self, file_path: &str) {
         self.file_states.remove(file_path);
     }
 
     /// Clear all tracking state
+    #[allow(dead_code)]
     pub fn clear_all(&mut self) {
         self.file_states.clear();
     }
