@@ -22,6 +22,33 @@ message SimpleRange {
     int32 end_column = 4;
 }
 
+// Cursor range (start and end positions)
+message CursorRange {
+    CursorPosition start_position = 1;
+    CursorPosition end_position = 2;
+}
+
+// Diagnostic information (errors/warnings from LSP)
+message Diagnostic {
+    enum DiagnosticSeverity {
+        DIAGNOSTIC_SEVERITY_UNSPECIFIED = 0;
+        DIAGNOSTIC_SEVERITY_ERROR = 1;
+        DIAGNOSTIC_SEVERITY_WARNING = 2;
+        DIAGNOSTIC_SEVERITY_INFORMATION = 3;
+        DIAGNOSTIC_SEVERITY_HINT = 4;
+    }
+
+    message RelatedInformation {
+        string message = 1;
+        CursorRange range = 2;
+    }
+
+    string message = 1;
+    CursorRange range = 2;
+    DiagnosticSeverity severity = 3;
+    repeated RelatedInformation related_information = 4;
+}
+
 // File info
 message CurrentFileInfo {
     string relative_workspace_path = 1;
@@ -34,6 +61,8 @@ message CurrentFileInfo {
     optional int32 file_version = 14;
     string workspace_root_path = 19;
     optional string line_ending = 20;
+    // Diagnostic information (errors/warnings) - Phase 1 enhancement
+    repeated Diagnostic diagnostics = 7;
 }
 
 // Diff history
@@ -174,6 +203,32 @@ message CppConfigResponse {
     string cpp_url = 13;
     string geo_cpp_backend_url = 18;
     bool is_fused_cursor_prediction_model = 20;
+    // Phase 3: Enhanced config fields
+    optional bool allows_tab_chunks = 21;
+    optional int32 tab_context_refresh_debounce_ms = 22;
+    optional int32 tab_context_refresh_editor_change_debounce_ms = 23;
+}
+
+// Phase 2: Tab Context Refresh API (for RAG-based context retrieval)
+// Triggered on file switch or user idle
+message RefreshTabContextRequest {
+    // Current file context
+    CurrentFileInfo current_file = 1;
+    // Project identifier
+    string workspace_id = 2;
+    // Model name (e.g., "claude-3-5-sonnet", "cursor-small")
+    optional string model_name = 3;
+    // Whether to include diff history
+    optional bool include_diff_history = 4;
+}
+
+message RefreshTabContextResponse {
+    // Server-retrieved high-relevance code snippets
+    repeated CppContextItem context_items = 1;
+    // Whether the request was successful
+    optional bool success = 2;
+    // Suggested cache TTL (in milliseconds)
+    optional int32 cache_ttl_ms = 3;
 }
 
 // Append completion request/response

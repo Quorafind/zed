@@ -1,5 +1,5 @@
 [package]
-name = "cometix"
+name = "ctab"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
@@ -9,7 +9,7 @@ license = "GPL-3.0-or-later"
 workspace = true
 
 [lib]
-path = "src/cometix.rs"
+path = "src/ctab.rs"
 doctest = false
 
 [features]
@@ -40,6 +40,7 @@ settings.workspace = true
 sha2.workspace = true
 hex.workspace = true
 util.workspace = true
+unicode-segmentation.workspace = true
 similar = "2.6"
 prost = "0.13"
 

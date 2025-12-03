@@ -3516,33 +3516,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cometix"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "collections",
- "edit_prediction",
- "futures 0.3.31",
- "gpui",
- "hex",
- "http_client",
- "language",
- "log",
- "parking_lot",
- "project",
- "prost 0.13.5",
- "prost-build 0.13.5",
- "rand 0.9.2",
- "schemars",
- "serde",
- "serde_json",
- "settings",
- "sha2",
- "similar",
- "util",
-]
-
-[[package]]
 name = "comfy-table"
 version = "7.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4441,6 +4414,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "edit_prediction",
+ "futures 0.3.31",
+ "gpui",
+ "hex",
+ "http_client",
+ "language",
+ "log",
+ "parking_lot",
+ "project",
+ "prost 0.13.5",
+ "prost-build 0.13.5",
+ "rand 0.9.2",
+ "schemars",
+ "serde",
+ "serde_json",
+ "settings",
+ "sha2",
+ "similar",
+ "unicode-segmentation",
+ "util",
+]
+
+[[package]]
 name = "ctor"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5316,8 +5317,8 @@ dependencies = [
  "client",
  "cloud_llm_client",
  "codestral",
- "cometix",
  "copilot",
+ "ctab",
  "edit_prediction",
  "editor",
  "feature_flags",
@@ -21306,11 +21307,11 @@ dependencies = [
  "codestral",
  "collab_ui",
  "collections",
- "cometix",
  "command_palette",
  "component",
  "copilot",
  "crashes",
+ "ctab",
  "dap",
  "dap_adapters",
  "db",

@@ -1,8 +1,9 @@
-//! Cometix completion provider for Zed
+//! Ctab completion provider for Zed
 //!
 //! This crate provides an edit prediction provider that integrates with
 //! the Cursor AI completion API (api2.cursor.sh) or self-hosted cursor-api servers.
 
+mod completion_differ;
 mod completion_provider;
 mod diff_tracker;
 mod file_sync;
@@ -11,7 +12,7 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/aiserver.v1.rs"));
 }
 
-pub use completion_provider::CometixCompletionProvider;
+pub use completion_provider::CtabCompletionProvider;
 
 use gpui::App;
 use settings::{RegisterSetting, Settings, SettingsContent};
@@ -22,9 +23,9 @@ pub const DEFAULT_API_URL: &str = "https://api2.cursor.sh";
 /// Default API base URL for self-hosted servers
 pub const DEFAULT_SELFHOSTED_URL: &str = "http://localhost:8000";
 
-/// Initialize the Cometix completion provider
+/// Initialize the Ctab completion provider
 pub fn init(cx: &mut App) {
-    CometixSettings::register(cx);
+    CtabSettings::register(cx);
 }
 
 /// The type of endpoint to use for API calls
@@ -39,10 +40,10 @@ pub enum EndpointType {
     Selfhosted,
 }
 
-/// Settings for Cometix
+/// Settings for Ctab
 #[derive(Clone, Debug, Default, RegisterSetting)]
-pub struct CometixSettings {
-    /// Whether Cometix is enabled
+pub struct CtabSettings {
+    /// Whether Ctab is enabled
     pub enabled: bool,
     /// The authentication token for the Cursor API
     pub auth_token: Option<String>,
@@ -60,7 +61,7 @@ pub struct CometixSettings {
     pub max_completion_length: u32,
 }
 
-impl CometixSettings {
+impl CtabSettings {
     /// Returns the effective base URL based on endpoint type
     pub fn effective_base_url(&self) -> &str {
         if let Some(ref url) = self.base_url {
@@ -121,44 +122,42 @@ impl CometixSettings {
     }
 }
 
-impl Settings for CometixSettings {
+impl Settings for CtabSettings {
     fn from_settings(content: &SettingsContent) -> Self {
-        let cometix = content.cometix.as_ref();
+        let ctab = content.ctab.as_ref();
 
         log::info!(
-            "Cometix: from_settings called, cometix section present: {}",
-            cometix.is_some()
+            "Ctab: from_settings called, ctab section present: {}",
+            ctab.is_some()
         );
 
-        if let Some(c) = cometix {
+        if let Some(c) = ctab {
             log::info!(
-                "Cometix: config values - endpoint_type={:?}, base_url={:?}, auth_token={}",
+                "Ctab: config values - endpoint_type={:?}, base_url={:?}, auth_token={}",
                 c.endpoint_type,
                 c.base_url,
                 c.auth_token.is_some()
             );
         }
 
-        let endpoint_type = cometix
+        let endpoint_type = ctab
             .and_then(|c| c.endpoint_type)
             .map(|e| match e {
-                settings::CometixEndpointType::Official => EndpointType::Official,
-                settings::CometixEndpointType::SelfhostedProxy => EndpointType::SelfhostedProxy,
-                settings::CometixEndpointType::Selfhosted => EndpointType::Selfhosted,
+                settings::CtabEndpointType::Official => EndpointType::Official,
+                settings::CtabEndpointType::SelfhostedProxy => EndpointType::SelfhostedProxy,
+                settings::CtabEndpointType::Selfhosted => EndpointType::Selfhosted,
             })
             .unwrap_or_default();
 
-        CometixSettings {
-            enabled: cometix.and_then(|c| c.enabled).unwrap_or(true),
-            auth_token: cometix.and_then(|c| c.auth_token.clone()),
-            base_url: cometix.and_then(|c| c.base_url.clone()),
-            client_key: cometix.and_then(|c| c.client_key.clone()),
+        CtabSettings {
+            enabled: ctab.and_then(|c| c.enabled).unwrap_or(true),
+            auth_token: ctab.and_then(|c| c.auth_token.clone()),
+            base_url: ctab.and_then(|c| c.base_url.clone()),
+            client_key: ctab.and_then(|c| c.client_key.clone()),
             endpoint_type,
-            model: cometix.and_then(|c| c.model.clone()),
-            debounce_ms: cometix.and_then(|c| c.debounce_ms).unwrap_or(75),
-            max_completion_length: cometix
-                .and_then(|c| c.max_completion_length)
-                .unwrap_or(2000),
+            model: ctab.and_then(|c| c.model.clone()),
+            debounce_ms: ctab.and_then(|c| c.debounce_ms).unwrap_or(75),
+            max_completion_length: ctab.and_then(|c| c.max_completion_length).unwrap_or(2000),
         }
     }
 }

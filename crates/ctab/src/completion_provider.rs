@@ -10,20 +10,23 @@ use edit_prediction::{Direction, EditPrediction, EditPredictionProvider};
 use futures::AsyncReadExt;
 use gpui::{App, Context, Entity, EntityId, SharedString, Task};
 use http_client::{AsyncBody, HttpClient, Method};
-use language::{Anchor, Buffer, Point, ToOffset};
+use language::{Anchor, Buffer, DiagnosticSeverity, Point, ToOffset};
 use parking_lot::Mutex;
 use prost::Message;
 use settings::Settings;
 use sha2::{Digest, Sha256};
+use unicode_segmentation::UnicodeSegmentation;
 
-use crate::CometixSettings;
+use crate::CtabSettings;
+use crate::completion_differ::{CompletionContext, SmartCompletionDiffer};
 use crate::diff_tracker::DiffTracker;
 use crate::file_sync::FileSyncManager;
 use crate::proto::{
     AdditionalFile, CppAppendRequest, CppConfigRequest, CppConfigResponse, CppContextItem, CppFate,
-    CppFileDiffHistory, CppIntentInfo, CurrentFileInfo, CursorPosition,
-    FilesyncUpdateWithModelVersion, FsUploadErrorType, RecordCppFateRequest, StreamCppRequest,
-    StreamCppResponse,
+    CppFileDiffHistory, CppIntentInfo, CurrentFileInfo, CursorPosition, CursorRange,
+    Diagnostic as ProtoDiagnostic, FilesyncUpdateWithModelVersion, FsUploadErrorType,
+    RecordCppFateRequest, StreamCppRequest, StreamCppResponse,
+    diagnostic::DiagnosticSeverity as ProtoDiagnosticSeverity,
 };
 use project::Project;
 
@@ -52,7 +55,7 @@ impl CachedConfig {
     }
 }
 
-pub struct CometixCompletionProvider {
+pub struct CtabCompletionProvider {
     http_client: Arc<dyn HttpClient>,
     project: Option<Entity<Project>>,
     diff_tracker: Arc<Mutex<DiffTracker>>,
@@ -68,6 +71,8 @@ pub struct CometixCompletionProvider {
     filesync_client_key: String,
     /// FileSync cookie value (32-char hex) - used for FilesyncCookie header
     filesync_cookie: String,
+    /// Whether to skip the next refresh request (used when completion indicates no retrigger)
+    skip_next_refresh: bool,
 }
 
 struct CompletionState {
@@ -79,9 +84,11 @@ struct CompletionState {
     range_end: Anchor,
     #[allow(dead_code)]
     api_range: Option<(i32, i32)>,
+    /// Whether to retrigger completion after accepting this one
+    should_retrigger: bool,
 }
 
-impl CometixCompletionProvider {
+impl CtabCompletionProvider {
     pub fn new(http_client: Arc<dyn HttpClient>, project: Option<Entity<Project>>) -> Self {
         // Generate workspace_id - will be updated when we have project context
         let workspace_id = generate_workspace_id();
@@ -99,6 +106,7 @@ impl CometixCompletionProvider {
             workspace_id,
             filesync_client_key: generate_filesync_client_key(),
             filesync_cookie: generate_filesync_cookie(),
+            skip_next_refresh: false,
         }
     }
 
@@ -392,13 +400,15 @@ impl CometixCompletionProvider {
             );
             match StreamCppResponse::decode(payload) {
                 Ok(msg) => {
+                    // Safely truncate text for logging (respecting UTF-8 char boundaries)
+                    let truncated_text = if msg.text.chars().count() > 50 {
+                        format!("{}...", msg.text.chars().take(50).collect::<String>())
+                    } else {
+                        msg.text.clone()
+                    };
                     log::info!(
                         "Cometix: Decoded message - text='{}', done_stream={:?}, binding_id={:?}",
-                        if msg.text.len() > 50 {
-                            format!("{}...", &msg.text[..50])
-                        } else {
-                            msg.text.clone()
-                        },
+                        truncated_text,
                         msg.done_stream,
                         msg.binding_id
                     );
@@ -505,7 +515,7 @@ impl CometixCompletionProvider {
 
     /// Sends fate recording asynchronously without blocking.
     fn send_fate(&self, binding_id: String, fate: CppFate, cx: &mut Context<Self>) {
-        let settings = CometixSettings::get_global(cx);
+        let settings = CtabSettings::get_global(cx);
 
         let Some(auth_token) = settings.auth_token.clone() else {
             return;
@@ -598,7 +608,7 @@ impl CometixCompletionProvider {
     ///
     /// This method is fire-and-forget - it spawns an async task and returns immediately.
     pub fn trigger_append(&self, changes: Vec<u8>, cx: &mut Context<Self>) {
-        let settings = CometixSettings::get_global(cx);
+        let settings = CtabSettings::get_global(cx);
 
         let Some(auth_token) = settings.auth_token.clone() else {
             log::debug!("Cometix: Skipping CppAppend - no auth token");
@@ -711,6 +721,16 @@ impl CometixCompletionProvider {
             config.geo_cpp_backend_url
         );
 
+        // Phase 3: Log enhanced config fields if present
+        if config.allows_tab_chunks.is_some() || config.tab_context_refresh_debounce_ms.is_some() {
+            log::info!(
+                "Cometix: Enhanced config - allows_tab_chunks={:?}, tab_refresh_debounce_ms={:?}, editor_change_debounce_ms={:?}",
+                config.allows_tab_chunks,
+                config.tab_context_refresh_debounce_ms,
+                config.tab_context_refresh_editor_change_debounce_ms
+            );
+        }
+
         Ok(config)
     }
 
@@ -745,7 +765,7 @@ impl CometixCompletionProvider {
 
     /// Triggers an async config refresh in the background.
     fn refresh_config_async(&self, cx: &mut Context<Self>) {
-        let settings = CometixSettings::get_global(cx);
+        let settings = CtabSettings::get_global(cx);
 
         let Some(auth_token) = settings.auth_token.clone() else {
             return;
@@ -811,6 +831,14 @@ impl CometixCompletionProvider {
     /// Returns a tuple of (additional_files, context_items):
     /// - additional_files: Used for session state tracking
     /// - context_items: Used for RAG-based code context (primary source for model)
+    /// Phase 2: Enhanced context collection with relevance scoring
+    ///
+    /// Scoring factors:
+    /// - Same language extension: +10.0
+    /// - Same directory: +5.0
+    /// - Parent/sibling directory: +2.0
+    /// - File name referenced in current content: +50.0 (import/use detection)
+    /// - Token overlap (Jaccard similarity): up to +20.0
     fn collect_additional_files(
         &self,
         current_file_path: &str,
@@ -823,15 +851,48 @@ impl CometixCompletionProvider {
 
         let project = project.read(cx);
 
-        // Get current file extension for language-based prioritization
+        // Get current file info for scoring
         let current_ext = current_file_path
             .rsplit('.')
             .next()
             .map(|s| s.to_lowercase());
 
-        // Collect candidate files, separated by language match
-        let mut same_lang_files: Vec<(AdditionalFile, CppContextItem)> = Vec::new();
-        let mut other_files: Vec<(AdditionalFile, CppContextItem)> = Vec::new();
+        let current_dir = std::path::Path::new(current_file_path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string());
+
+        let current_parent_dir = std::path::Path::new(current_file_path)
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_string_lossy().to_string());
+
+        // Get current file content for reference detection (we'll fetch it from buffer)
+        let current_content = project
+            .opened_buffers(cx)
+            .into_iter()
+            .find(|b| {
+                b.read(cx)
+                    .file()
+                    .map(|f| f.path().as_unix_str().to_string() == current_file_path)
+                    .unwrap_or(false)
+            })
+            .map(|b| b.read(cx).text())
+            .unwrap_or_default();
+
+        // Extract tokens from current content for Jaccard similarity
+        let current_tokens: std::collections::HashSet<&str> = current_content
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|s| s.len() > 2) // Filter out very short tokens
+            .collect();
+
+        // Collect scored files
+        struct ScoredFile {
+            additional_file: AdditionalFile,
+            context_item: CppContextItem,
+            score: f32,
+        }
+
+        let mut scored_files: Vec<ScoredFile> = Vec::new();
 
         let now_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -867,6 +928,65 @@ impl CometixCompletionProvider {
                 continue;
             }
 
+            // Calculate relevance score
+            let mut score: f32 = 0.0;
+
+            // 1. Same language extension: +10.0
+            let file_ext = file_path.rsplit('.').next().map(|s| s.to_lowercase());
+            if file_ext == current_ext {
+                score += 10.0;
+            }
+
+            // 2. Directory proximity
+            let file_dir = std::path::Path::new(&file_path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string());
+            let file_parent_dir = std::path::Path::new(&file_path)
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_string_lossy().to_string());
+
+            if file_dir == current_dir {
+                // Same directory: +5.0
+                score += 5.0;
+            } else if file_parent_dir == current_parent_dir || file_dir == current_parent_dir {
+                // Sibling or parent directory: +2.0
+                score += 2.0;
+            }
+
+            // 3. File name referenced in current content: +50.0
+            // Check if the file stem (e.g., "utils" from "utils.rs") appears in current content
+            let file_stem = std::path::Path::new(&file_path)
+                .file_stem()
+                .and_then(|s| s.to_str());
+            if let Some(stem) = file_stem {
+                if stem.len() > 2 && current_content.contains(stem) {
+                    score += 50.0;
+                    log::debug!(
+                        "Cometix: File {} referenced in current content (+50)",
+                        file_path
+                    );
+                }
+            }
+
+            // 4. Token overlap (Jaccard similarity): up to +20.0
+            // Only compute for reasonably-sized files to avoid performance issues
+            if content.len() < 15_000 && !current_tokens.is_empty() {
+                let file_tokens: std::collections::HashSet<&str> = content
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .filter(|s| s.len() > 2)
+                    .collect();
+
+                if !file_tokens.is_empty() {
+                    let intersection = current_tokens.intersection(&file_tokens).count();
+                    let union = current_tokens.len() + file_tokens.len() - intersection;
+                    if union > 0 {
+                        let jaccard = intersection as f32 / union as f32;
+                        score += jaccard * 20.0;
+                    }
+                }
+            }
+
             // Build visible range content (full file for now)
             let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
             let total_lines = lines.len() as i32;
@@ -875,7 +995,6 @@ impl CometixCompletionProvider {
                 relative_workspace_path: file_path.clone(),
                 is_open: true,
                 visible_range_content: lines,
-                // Use current timestamp for last_viewed_at since file is currently open
                 last_viewed_at: Some(now_timestamp),
                 start_line_number_one_indexed: vec![1],
                 visible_ranges: vec![crate::proto::LineRange {
@@ -884,43 +1003,52 @@ impl CometixCompletionProvider {
                 }],
             };
 
-            // Build context item for RAG context
+            // Build context item for RAG context with computed score
             let context_item = CppContextItem {
                 contents: content,
                 symbol: None,
                 relative_workspace_path: file_path.clone(),
-                score: 1.0, // Default score
+                score,
             };
 
-            // Prioritize files with the same extension
-            let file_ext = file_path.rsplit('.').next().map(|s| s.to_lowercase());
-            if file_ext == current_ext {
-                same_lang_files.push((additional_file, context_item));
-            } else {
-                other_files.push((additional_file, context_item));
-            }
+            scored_files.push(ScoredFile {
+                additional_file,
+                context_item,
+                score,
+            });
         }
 
-        // Combine: same-language files first, then others
-        let mut combined = same_lang_files;
-        combined.extend(other_files);
+        // Sort by score descending
+        scored_files.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Limit to MAX_ADDITIONAL_FILES
-        combined.truncate(MAX_ADDITIONAL_FILES);
+        scored_files.truncate(MAX_ADDITIONAL_FILES);
 
         log::info!(
-            "Cometix: Collected {} additional files and context items",
-            combined.len()
+            "Cometix: Collected {} additional files (scores: {})",
+            scored_files.len(),
+            scored_files
+                .iter()
+                .map(|f| format!("{:.1}", f.score))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
 
         // Split into separate vectors
-        let (additional_files, context_items): (Vec<_>, Vec<_>) = combined.into_iter().unzip();
+        let (additional_files, context_items): (Vec<_>, Vec<_>) = scored_files
+            .into_iter()
+            .map(|sf| (sf.additional_file, sf.context_item))
+            .unzip();
 
         (additional_files, context_items)
     }
 }
 
-impl EditPredictionProvider for CometixCompletionProvider {
+impl EditPredictionProvider for CtabCompletionProvider {
     fn name() -> &'static str {
         "cometix"
     }
@@ -942,7 +1070,7 @@ impl EditPredictionProvider for CometixCompletionProvider {
     }
 
     fn is_enabled(&self, _buffer: &Entity<Buffer>, _cursor_position: Anchor, cx: &App) -> bool {
-        let settings = CometixSettings::get_global(cx);
+        let settings = CtabSettings::get_global(cx);
         settings.enabled && settings.auth_token.is_some()
     }
 
@@ -961,10 +1089,17 @@ impl EditPredictionProvider for CometixCompletionProvider {
         self.pending_refresh = None;
         self.current_completion = None;
 
+        // Check if we should skip this refresh (e.g., previous completion indicated no retrigger)
+        if self.skip_next_refresh {
+            log::debug!("Cometix: Skipping refresh (requested by previous completion)");
+            self.skip_next_refresh = false;
+            return;
+        }
+
         // Ensure we have a stable workspace_id based on project path
         self.ensure_stable_workspace_id(cx);
 
-        let settings = CometixSettings::get_global(cx);
+        let settings = CtabSettings::get_global(cx);
 
         // Check if enabled and has auth token
         if !settings.enabled {
@@ -1128,14 +1263,61 @@ impl EditPredictionProvider for CometixCompletionProvider {
             filesync_updates.len()
         );
 
+        // Phase 1: Collect diagnostics from buffer
+        // Only collect Error and Warning severity, limit to 20 entries to save tokens
+        let diagnostics: Vec<ProtoDiagnostic> = snapshot
+            .diagnostics_in_range::<_, Point>(0..snapshot.len(), false)
+            .filter(|entry| {
+                matches!(
+                    entry.diagnostic.severity,
+                    DiagnosticSeverity::ERROR | DiagnosticSeverity::WARNING
+                )
+            })
+            .take(20)
+            .map(|entry| {
+                let severity = match entry.diagnostic.severity {
+                    DiagnosticSeverity::ERROR => ProtoDiagnosticSeverity::Error,
+                    DiagnosticSeverity::WARNING => ProtoDiagnosticSeverity::Warning,
+                    DiagnosticSeverity::INFORMATION => ProtoDiagnosticSeverity::Information,
+                    DiagnosticSeverity::HINT => ProtoDiagnosticSeverity::Hint,
+                    _ => ProtoDiagnosticSeverity::Unspecified,
+                };
+
+                ProtoDiagnostic {
+                    message: entry.diagnostic.message.clone(),
+                    range: Some(CursorRange {
+                        start_position: Some(CursorPosition {
+                            line: entry.range.start.row as i32,
+                            column: entry.range.start.column as i32,
+                        }),
+                        end_position: Some(CursorPosition {
+                            line: entry.range.end.row as i32,
+                            column: entry.range.end.column as i32,
+                        }),
+                    }),
+                    severity: severity.into(),
+                    related_information: vec![],
+                }
+            })
+            .collect();
+
+        if !diagnostics.is_empty() {
+            log::info!(
+                "Cometix: Collected {} diagnostics for {}",
+                diagnostics.len(),
+                file_path
+            );
+        }
+
         // Build the request
         log::info!(
-            "Cometix: Building request - file={}, cursor=({},{}), content_len={}, language={}",
+            "Cometix: Building request - file={}, cursor=({},{}), content_len={}, language={}, diagnostics={}",
             file_path,
             point.row,
             point.column,
             content.len(),
-            Self::detect_language(&file_path)
+            Self::detect_language(&file_path),
+            diagnostics.len()
         );
 
         // Log content preview for debugging
@@ -1160,6 +1342,8 @@ impl EditPredictionProvider for CometixCompletionProvider {
                 file_version: Some(file_version),
                 workspace_root_path: String::new(),
                 line_ending: Some("\n".to_string()),
+                // Phase 1: Include diagnostics for AI-assisted error fixing
+                diagnostics,
             }),
             // Note: diff_history field is deprecated, use file_diff_histories instead
             diff_history: vec![],
@@ -1237,7 +1421,17 @@ impl EditPredictionProvider for CometixCompletionProvider {
                 match response {
                     Ok(response) => {
                         if !response.text.is_empty() {
-                            log::debug!("Cometix: Received completion: {}", response.text);
+                            // DEBUG: Log raw API response with escape sequences visible
+                            log::info!(
+                                "Cometix: [DEBUG] Raw API completion (len={}): {:?}",
+                                response.text.len(),
+                                response.text
+                            );
+                            log::info!(
+                                "Cometix: [DEBUG] range_to_replace={:?}, should_remove_leading_eol={:?}",
+                                response.range_to_replace,
+                                response.should_remove_leading_eol
+                            );
 
                             // Determine range based on API response
                             let (range_start, range_end, api_range) = if let Some(ref range) =
@@ -1293,6 +1487,13 @@ impl EditPredictionProvider for CometixCompletionProvider {
                                     .unwrap_or(completion_text);
                             }
 
+                            // Determine if we should retrigger completion after this one
+                            let should_retrigger = response
+                                .cursor_prediction_target
+                                .as_ref()
+                                .map(|t| t.should_retrigger_cpp)
+                                .unwrap_or(true); // Default to true to maintain existing behavior
+
                             // Store the completion
                             this.current_completion = Some(CompletionState {
                                 text: completion_text,
@@ -1300,6 +1501,7 @@ impl EditPredictionProvider for CometixCompletionProvider {
                                 range_start,
                                 range_end,
                                 api_range,
+                                should_retrigger,
                             });
 
                             cx.notify();
@@ -1327,6 +1529,12 @@ impl EditPredictionProvider for CometixCompletionProvider {
 
     fn accept(&mut self, cx: &mut Context<Self>) {
         if let Some(completion) = self.current_completion.take() {
+            // Check if we should skip the next refresh (prevents completion loop)
+            if !completion.should_retrigger {
+                log::debug!("Cometix: Disabling next refresh (should_retrigger=false)");
+                self.skip_next_refresh = true;
+            }
+
             // Send fate recording
             if let Some(binding_id) = completion.binding_id {
                 self.send_fate(binding_id, CppFate::Accept, cx);
@@ -1367,60 +1575,334 @@ impl EditPredictionProvider for CometixCompletionProvider {
 
         let buffer_snapshot = buffer.read(cx);
         let cursor_offset = cursor_position.to_offset(buffer_snapshot);
-
-        // Get the current line content up to the cursor
         let cursor_point = buffer_snapshot.offset_to_point(cursor_offset);
-        let line_start_offset = buffer_snapshot.point_to_offset(Point::new(cursor_point.row, 0));
-        let text_before_cursor: String = buffer_snapshot
-            .chars_for_range(line_start_offset..cursor_offset)
-            .collect();
 
-        // Process completion text - strip leading newline if present
-        let mut completion_text = completion.text.as_str();
-        if completion_text.starts_with('\n') {
-            completion_text = &completion_text[1..];
-        } else if completion_text.starts_with("\r\n") {
-            completion_text = &completion_text[2..];
-        }
-
-        // Find common prefix between what user typed and completion
-        let prefix_len = common_prefix(text_before_cursor.chars(), completion_text.chars());
-
-        // The text to insert is the completion minus the common prefix
-        let insert_text = &completion_text[prefix_len..];
-
-        if insert_text.is_empty() {
+        let completion_text = completion.text.as_str();
+        if completion_text.is_empty() {
             return None;
         }
 
-        log::debug!(
-            "Cometix: suggest - text_before_cursor='{}', completion='{}', prefix_len={}, insert_text='{}'",
-            text_before_cursor,
-            if completion_text.len() > 50 {
-                &completion_text[..50]
-            } else {
-                completion_text
-            },
-            prefix_len,
-            if insert_text.len() > 50 {
-                &insert_text[..50]
-            } else {
-                insert_text
-            }
+        // Build completion context for smart differ
+        // When API provides a range, we need to include content from that range
+        // to properly detect overlaps
+        let context = if let Some((start_line_1, end_line_1)) = completion.api_range {
+            // API range is 1-indexed, convert to 0-indexed
+            let start_line_0 = (start_line_1.max(1) - 1) as u32;
+            let end_line_0 = (end_line_1.max(1) - 1) as u32;
+
+            // Build context that includes the range content
+            self.build_completion_context_with_range(
+                buffer_snapshot,
+                cursor_point,
+                cursor_offset,
+                start_line_0,
+                end_line_0,
+            )
+        } else {
+            self.build_completion_context(buffer_snapshot, cursor_point, cursor_offset)
+        };
+
+        // DEBUG: Log context information
+        log::info!(
+            "Cometix: [DEBUG] suggest() context - cursor=({},{}), before_cursor={:?}, after_cursor={:?}",
+            cursor_point.row,
+            cursor_point.column,
+            &context.before_cursor,
+            &context.after_cursor
+        );
+        log::info!(
+            "Cometix: [DEBUG] suggest() completion_text={:?}, api_range={:?}",
+            completion_text,
+            completion.api_range
         );
 
-        // Insert at cursor position
-        let insert_position = cursor_position.bias_right(buffer_snapshot);
-        let text: Arc<str> = Arc::from(insert_text);
+        // Use SmartCompletionDiffer to process the completion
+        let differ = SmartCompletionDiffer::new();
+        let diff_result =
+            differ.extract_completion_diff(&context, completion_text, completion.api_range);
+
+        // DEBUG: Log differ result
+        log::info!(
+            "Cometix: [DEBUG] SmartDiffer result - confidence={:.3}, method={:?}, optimizations={:?}",
+            diff_result.confidence,
+            diff_result.method,
+            diff_result.optimizations
+        );
+        log::info!(
+            "Cometix: [DEBUG] SmartDiffer insert_text={:?}",
+            diff_result.insert_text
+        );
+
+        let insert_text = &diff_result.insert_text;
+        if insert_text.is_empty() {
+            log::debug!("Cometix: SmartDiffer returned empty insert_text, skipping");
+            return None;
+        }
+
+        // For inline completion (ghost text), we use Supermaven's approach:
+        // Insert at cursor position with position..position range, combined with
+        // a delete_range that covers cursor to end of line for proper diff rendering.
+        //
+        // This is different from block replacement (Alt+L) which replaces entire lines.
+        let insert_text = insert_text.trim_end();
+        if insert_text.trim().is_empty() {
+            return None;
+        }
+
+        // Use completion_from_diff approach like Supermaven for proper inline rendering
+        let end_of_line = buffer_snapshot.anchor_after(language::Point::new(
+            cursor_point.row,
+            buffer_snapshot.line_len(cursor_point.row),
+        ));
+        let delete_range = cursor_position..end_of_line;
+
+        log::info!(
+            "Cometix: [DEBUG] Creating inline completion - cursor_offset={}, insert_len={}",
+            cursor_offset,
+            insert_text.len()
+        );
+
+        // Generate edits using diff-based approach for proper ghost text rendering
+        let edits = self.completion_from_diff(
+            buffer_snapshot,
+            insert_text,
+            cursor_position,
+            delete_range.clone(),
+        );
+
+        // DEBUG: Log the generated edits
+        log::info!(
+            "Cometix: [DEBUG] completion_from_diff generated {} edits",
+            edits.len()
+        );
+        for (idx, (range, text)) in edits.iter().enumerate() {
+            log::info!(
+                "Cometix: [DEBUG] edit[{}]: range={}..{}, text={:?}",
+                idx,
+                range.start.to_offset(buffer_snapshot),
+                range.end.to_offset(buffer_snapshot),
+                text.as_ref()
+            );
+        }
 
         Some(EditPrediction::Local {
             id: completion
                 .binding_id
                 .as_ref()
                 .map(|id| SharedString::from(id.clone())),
-            edits: vec![(insert_position..insert_position, text)],
+            edits,
             edit_preview: None,
         })
+    }
+}
+
+impl CtabCompletionProvider {
+    /// Generate edits from completion text using diff-based approach.
+    /// This matches the buffer text against completion text to create proper inlays.
+    /// Ported from Supermaven's completion_from_diff function.
+    fn completion_from_diff(
+        &self,
+        snapshot: &language::Buffer,
+        completion_text: &str,
+        position: Anchor,
+        delete_range: std::ops::Range<Anchor>,
+    ) -> Vec<(std::ops::Range<Anchor>, Arc<str>)> {
+        let buffer_text: String = snapshot
+            .text_for_range(
+                delete_range.start.to_offset(snapshot)..delete_range.end.to_offset(snapshot),
+            )
+            .collect();
+
+        // DEBUG: Log inputs to completion_from_diff
+        log::info!(
+            "Cometix: [DEBUG] completion_from_diff - completion_text={:?}, buffer_text={:?}",
+            completion_text,
+            buffer_text
+        );
+
+        let mut edits: Vec<(std::ops::Range<Anchor>, Arc<str>)> = Vec::new();
+
+        let completion_graphemes: Vec<&str> = completion_text.graphemes(true).collect();
+        let buffer_graphemes: Vec<&str> = buffer_text.graphemes(true).collect();
+
+        let mut offset = position.to_offset(snapshot);
+
+        let mut i = 0;
+        let mut j = 0;
+        while i < completion_graphemes.len() && j < buffer_graphemes.len() {
+            // Find the next instance of the buffer text in the completion text
+            let k = completion_graphemes[i..]
+                .iter()
+                .position(|c| *c == buffer_graphemes[j]);
+            match k {
+                Some(k) => {
+                    if k != 0 {
+                        let anchor = snapshot.anchor_after(offset);
+                        // The range from current position to item is an inlay
+                        let edit = (
+                            anchor..anchor,
+                            Arc::from(completion_graphemes[i..i + k].join("")),
+                        );
+                        edits.push(edit);
+                    }
+                    i += k + 1;
+                    j += 1;
+                    offset += buffer_graphemes[j - 1].len();
+                }
+                None => {
+                    // No more matching completions, drop remaining as inlay
+                    break;
+                }
+            }
+        }
+
+        if j == buffer_graphemes.len() && i < completion_graphemes.len() {
+            let anchor = snapshot.anchor_after(offset);
+            // Leftover completion text becomes an inlay
+            let edit_range = anchor..anchor;
+            let edit_text = completion_graphemes[i..].join("");
+            edits.push((edit_range, Arc::from(edit_text)));
+        }
+
+        edits
+    }
+    /// Build completion context for SmartCompletionDiffer
+    fn build_completion_context(
+        &self,
+        buffer: &language::Buffer,
+        cursor_point: Point,
+        cursor_offset: usize,
+    ) -> CompletionContext {
+        // Get text before cursor (current line up to cursor)
+        let line_start_offset = buffer.point_to_offset(Point::new(cursor_point.row, 0));
+        let before_cursor: String = buffer
+            .chars_for_range(line_start_offset..cursor_offset)
+            .collect();
+
+        // Get text after cursor (from cursor to end of current line, plus some following lines)
+        let line_end_offset = buffer.point_to_offset(Point::new(
+            cursor_point.row,
+            buffer.line_len(cursor_point.row),
+        ));
+
+        // Include up to 10 lines after cursor for overlap detection
+        let max_line = buffer.max_point().row;
+        let context_end_line = (cursor_point.row + 10).min(max_line);
+        let context_end_offset = if context_end_line > cursor_point.row {
+            buffer.point_to_offset(Point::new(
+                context_end_line,
+                buffer.line_len(context_end_line),
+            ))
+        } else {
+            line_end_offset
+        };
+
+        let after_cursor: String = buffer
+            .chars_for_range(cursor_offset..context_end_offset)
+            .collect();
+
+        // Get current line text
+        let current_line: String = buffer
+            .chars_for_range(line_start_offset..line_end_offset)
+            .collect();
+
+        // Calculate indentation
+        let indentation: String = current_line
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .collect();
+
+        // Get language
+        let language = buffer
+            .language()
+            .map(|l| l.name().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        CompletionContext {
+            before_cursor,
+            after_cursor,
+            current_line,
+            language,
+            indentation,
+            cursor_row: cursor_point.row,
+            cursor_col: cursor_point.column,
+        }
+    }
+
+    /// Build completion context with API-specified range for proper overlap detection.
+    ///
+    /// When API returns a `range_to_replace`, the completion text is meant to replace
+    /// that entire range. We need to include content from lines BEFORE the cursor
+    /// (within that range) in `before_cursor` so the differ can detect overlaps.
+    ///
+    /// Example scenario:
+    /// - Line 42: `newTD()`  <- cursor is at end of this line or start of next
+    /// - Line 43: (empty or next statement)
+    /// - API returns: `range_to_replace=(43,43)`, `text="newTD();"`
+    /// - Without range context: before_cursor="" (cursor at line start), no overlap detected
+    /// - With range context: before_cursor includes line 42 content, overlap detected
+    fn build_completion_context_with_range(
+        &self,
+        buffer: &language::Buffer,
+        cursor_point: Point,
+        cursor_offset: usize,
+        range_start_line: u32,
+        range_end_line: u32,
+    ) -> CompletionContext {
+        let max_line = buffer.max_point().row;
+
+        // Include a few lines before the range start for better context
+        let context_start_line = range_start_line.saturating_sub(3);
+        let context_start_offset = buffer.point_to_offset(Point::new(context_start_line, 0));
+
+        // Get text before cursor, including previous lines within context
+        // This captures content that might overlap with the completion
+        let before_cursor: String = buffer
+            .chars_for_range(context_start_offset..cursor_offset)
+            .collect();
+
+        // Get text after cursor, including lines up to and beyond the range end
+        let context_end_line = (range_end_line + 5).min(max_line);
+        let context_end_offset = buffer.point_to_offset(Point::new(
+            context_end_line,
+            buffer.line_len(context_end_line),
+        ));
+
+        let after_cursor: String = buffer
+            .chars_for_range(cursor_offset..context_end_offset)
+            .collect();
+
+        // Get current line text
+        let line_start_offset = buffer.point_to_offset(Point::new(cursor_point.row, 0));
+        let line_end_offset = buffer.point_to_offset(Point::new(
+            cursor_point.row,
+            buffer.line_len(cursor_point.row),
+        ));
+        let current_line: String = buffer
+            .chars_for_range(line_start_offset..line_end_offset)
+            .collect();
+
+        // Calculate indentation
+        let indentation: String = current_line
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .collect();
+
+        // Get language
+        let language = buffer
+            .language()
+            .map(|l| l.name().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        CompletionContext {
+            before_cursor,
+            after_cursor,
+            current_line,
+            language,
+            indentation,
+            cursor_row: cursor_point.row,
+            cursor_col: cursor_point.column,
+        }
     }
 }
 
