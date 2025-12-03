@@ -161,20 +161,20 @@ pub struct SettingsContent {
     /// Settings related to Vim mode in Zed.
     pub vim: Option<VimSettingsContent>,
 
-    /// Settings for Cometix (Cursor AI) edit predictions.
-    pub cometix: Option<CometixSettingsContent>,
+    /// Settings for Ctab (Cursor AI) edit predictions.
+    pub ctab: Option<CtabSettingsContent>,
 }
 
-/// Settings for Cometix (Cursor AI) completion provider.
+/// Settings for Ctab (Cursor AI) completion provider.
 #[with_fallible_options]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
-pub struct CometixSettingsContent {
-    /// Whether Cometix is enabled.
+pub struct CtabSettingsContent {
+    /// Whether Ctab is enabled.
     ///
     /// Default: true (when auth_token is configured)
     pub enabled: Option<bool>,
     /// The authentication token for the Cursor API.
-    /// Required for Cometix to function.
+    /// Required for Ctab to function.
     pub auth_token: Option<String>,
     /// The base URL for the API.
     ///
@@ -187,7 +187,7 @@ pub struct CometixSettingsContent {
     /// The endpoint type: "official" for api2.cursor.sh or "selfhosted" for custom servers.
     ///
     /// Default: official
-    pub endpoint_type: Option<CometixEndpointType>,
+    pub endpoint_type: Option<CtabEndpointType>,
     /// The model to use for completions.
     ///
     /// Default: auto
@@ -202,12 +202,12 @@ pub struct CometixSettingsContent {
     pub max_completion_length: Option<u32>,
 }
 
-/// The type of endpoint to use for Cometix API calls.
+/// The type of endpoint to use for Ctab API calls.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
 )]
 #[serde(rename_all = "lowercase")]
-pub enum CometixEndpointType {
+pub enum CtabEndpointType {
     /// Official Cursor API (api2.cursor.sh) using Connect RPC format.
     #[default]
     Official,
