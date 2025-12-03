@@ -40,7 +40,6 @@ settings.workspace = true
 sha2.workspace = true
 hex.workspace = true
 util.workspace = true
-unicode-segmentation.workspace = true
 similar = "2.6"
 prost = "0.13"
 

@@ -7,6 +7,7 @@ mod completion_differ;
 mod completion_provider;
 mod diff_tracker;
 mod file_sync;
+mod snapshot_differ;
 
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/aiserver.v1.rs"));

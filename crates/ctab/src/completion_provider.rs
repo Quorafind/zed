@@ -10,15 +10,15 @@ use edit_prediction::{Direction, EditPrediction, EditPredictionProvider};
 use futures::AsyncReadExt;
 use gpui::{App, Context, Entity, EntityId, SharedString, Task};
 use http_client::{AsyncBody, HttpClient, Method};
-use language::{Anchor, Buffer, DiagnosticSeverity, Point, ToOffset};
+use language::{
+    Anchor, Buffer, BufferSnapshot, DiagnosticSeverity, OffsetRangeExt, Point, ToOffset,
+};
 use parking_lot::Mutex;
 use prost::Message;
 use settings::Settings;
 use sha2::{Digest, Sha256};
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::CtabSettings;
-use crate::completion_differ::{CompletionContext, SmartCompletionDiffer};
 use crate::diff_tracker::DiffTracker;
 use crate::file_sync::FileSyncManager;
 use crate::proto::{
@@ -28,6 +28,7 @@ use crate::proto::{
     RecordCppFateRequest, StreamCppRequest, StreamCppResponse,
     diagnostic::DiagnosticSeverity as ProtoDiagnosticSeverity,
 };
+use crate::snapshot_differ::SnapshotDiffer;
 use project::Project;
 
 /// Cache TTL for CppConfig (5 minutes)
@@ -86,6 +87,11 @@ struct CompletionState {
     api_range: Option<(i32, i32)>,
     /// Whether to retrigger completion after accepting this one
     should_retrigger: bool,
+    /// Pre-computed edits from SnapshotDiffer (computed in refresh, used in suggest)
+    /// This avoids expensive computation in the UI thread during suggest()
+    precomputed_edits: Option<Vec<(std::ops::Range<Anchor>, Arc<str>)>>,
+    /// Original buffer snapshot when edits were computed (for interpolation)
+    original_snapshot: Option<BufferSnapshot>,
 }
 
 impl CtabCompletionProvider {
@@ -817,6 +823,72 @@ impl CtabCompletionProvider {
     /// This method gathers open files to provide multi-file context to the
     /// completion API, improving suggestion quality.
     ///
+    /// Retrieves the enclosing symbol (function/class/method) context using TreeSitter.
+    ///
+    /// This provides the model with the full scope of the current code block,
+    /// improving context awareness for completions within functions or classes.
+    ///
+    /// Uses `symbols_containing` which is a synchronous TreeSitter-based API,
+    /// avoiding the latency of LSP calls.
+    fn get_enclosing_context(
+        &self,
+        snapshot: &BufferSnapshot,
+        cursor_offset: usize,
+        file_path: &str,
+    ) -> Option<CppContextItem> {
+        log::info!(
+            "Cometix: get_enclosing_context called - offset={}, file={}",
+            cursor_offset,
+            file_path
+        );
+
+        // symbols_containing returns symbols sorted by hierarchy (outermost to innermost).
+        // The last element is the most specific enclosing scope (e.g., inner function).
+        let symbols = snapshot.symbols_containing(cursor_offset, None);
+
+        log::info!(
+            "Cometix: symbols_containing returned {} symbols",
+            symbols.len()
+        );
+
+        if symbols.is_empty() {
+            log::info!(
+                "Cometix: No enclosing symbols found at offset {}",
+                cursor_offset
+            );
+            return None;
+        }
+
+        // Get the innermost (most specific) enclosing symbol
+        let innermost = symbols.last()?;
+
+        // Convert anchor range to offset range and extract the text
+        let range = innermost.range.to_offset(snapshot);
+        let contents: String = snapshot.text_for_range(range).collect();
+
+        // Skip if the scope is too large (> 10KB) to avoid overwhelming the context
+        if contents.len() > 10 * 1024 {
+            log::debug!(
+                "Cometix: Enclosing scope too large ({} bytes), skipping",
+                contents.len()
+            );
+            return None;
+        }
+
+        log::info!(
+            "Cometix: Found enclosing scope '{}' ({} bytes)",
+            innermost.text,
+            contents.len()
+        );
+
+        Some(CppContextItem {
+            contents,
+            symbol: Some(innermost.text.clone()),
+            relative_workspace_path: file_path.to_string(),
+            score: 1.0, // High relevance for the immediate enclosing scope
+        })
+    }
+
     /// Strategy:
     /// 1. Get all open buffers from the project
     /// 2. Filter out the current file and files that are too large
@@ -1164,12 +1236,20 @@ impl EditPredictionProvider for CtabCompletionProvider {
         self.current_file_path = Some(file_path.clone());
 
         // Collect additional files and context items for multi-file context
-        let (additional_files, context_items) = self.collect_additional_files(&file_path, cx);
+        let (additional_files, mut context_items) = self.collect_additional_files(&file_path, cx);
 
-        // Build diff history
-        let diff_history = {
+        // Add enclosing scope context (TreeSitter based, synchronous)
+        if let Some(enclosing_context) = self.get_enclosing_context(&snapshot, offset, &file_path) {
+            context_items.push(enclosing_context);
+        }
+
+        // Build and retrieve diff history with timestamps
+        let (diff_history, diff_timestamps) = {
             let mut tracker = self.diff_tracker.lock();
-            tracker.build_diff_history(&file_path, &content)
+            // Update tracker with current content
+            tracker.build_diff_history(&file_path, &content);
+            // Retrieve full history with timestamps
+            tracker.get_diff_history(&file_path)
         };
 
         let file_version = {
@@ -1348,7 +1428,7 @@ impl EditPredictionProvider for CtabCompletionProvider {
             // Note: diff_history field is deprecated, use file_diff_histories instead
             diff_history: vec![],
             model_name: Some(model_name),
-            // Build proper CppFileDiffHistory structure with file name
+            // Build proper CppFileDiffHistory structure with complete history
             file_diff_histories: if diff_history.is_empty() {
                 vec![]
             } else {
@@ -1360,13 +1440,8 @@ impl EditPredictionProvider for CtabCompletionProvider {
                     .to_string();
                 vec![CppFileDiffHistory {
                     file_name,
-                    diff_history: vec![diff_history],
-                    diff_history_timestamps: vec![
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs_f64())
-                            .unwrap_or(0.0),
-                    ],
+                    diff_history,
+                    diff_history_timestamps: diff_timestamps,
                 }]
             },
             immediately_ack: Some(false),
@@ -1395,6 +1470,9 @@ impl EditPredictionProvider for CtabCompletionProvider {
         let http_client = self.http_client.clone();
         let filesync_client_key = self.filesync_client_key.clone();
         let filesync_cookie = self.filesync_cookie.clone();
+
+        // Capture buffer for diff calculation in the async callback
+        let buffer_for_diff = buffer.clone();
 
         self.pending_refresh = Some(cx.spawn(async move |this, cx| {
             if debounce {
@@ -1494,7 +1572,37 @@ impl EditPredictionProvider for CtabCompletionProvider {
                                 .map(|t| t.should_retrigger_cpp)
                                 .unwrap_or(true); // Default to true to maintain existing behavior
 
-                            // Store the completion
+                            // Pre-compute edits using SnapshotDiffer (avoid heavy work in suggest())
+                            // This is the KEY FIX for the hang issue: diff computation happens here
+                            // in the async context, not in the UI thread during suggest()
+                            let buffer_ref = buffer_for_diff.read(cx);
+                            let buffer_snapshot = buffer_ref.snapshot();
+                            let cursor_offset = cursor_position.to_offset(&buffer_snapshot);
+                            let cursor_point = buffer_snapshot.offset_to_point(cursor_offset);
+
+                            let snapshot_differ = SnapshotDiffer::new();
+                            let diff_result = snapshot_differ.extract_inline_edits(
+                                &buffer_snapshot,
+                                cursor_offset,
+                                cursor_point,
+                                &completion_text,
+                                api_range,
+                            );
+
+                            log::info!(
+                                "Cometix: Pre-computed {} edits, confidence={:.3}, optimizations={:?}",
+                                diff_result.edits.len(),
+                                diff_result.confidence,
+                                diff_result.optimizations
+                            );
+
+                            let precomputed_edits = if diff_result.edits.is_empty() {
+                                None
+                            } else {
+                                Some(diff_result.edits)
+                            };
+
+                            // Store the completion with pre-computed edits and snapshot for interpolation
                             this.current_completion = Some(CompletionState {
                                 text: completion_text,
                                 binding_id: response.binding_id,
@@ -1502,6 +1610,8 @@ impl EditPredictionProvider for CtabCompletionProvider {
                                 range_end,
                                 api_range,
                                 should_retrigger,
+                                precomputed_edits,
+                                original_snapshot: Some(buffer_snapshot),
                             });
 
                             cx.notify();
@@ -1563,7 +1673,7 @@ impl EditPredictionProvider for CtabCompletionProvider {
     fn suggest(
         &mut self,
         buffer: &Entity<Buffer>,
-        cursor_position: Anchor,
+        _cursor_position: Anchor,
         cx: &mut Context<Self>,
     ) -> Option<EditPrediction> {
         let completion = self.current_completion.as_ref()?;
@@ -1573,117 +1683,37 @@ impl EditPredictionProvider for CtabCompletionProvider {
             return None;
         }
 
-        let buffer_snapshot = buffer.read(cx);
-        let cursor_offset = cursor_position.to_offset(buffer_snapshot);
-        let cursor_point = buffer_snapshot.offset_to_point(cursor_offset);
+        // Get pre-computed edits and original snapshot for interpolation
+        let precomputed_edits = completion.precomputed_edits.as_ref()?;
+        let original_snapshot = completion.original_snapshot.as_ref()?;
 
-        let completion_text = completion.text.as_str();
-        if completion_text.is_empty() {
+        if precomputed_edits.is_empty() {
+            log::debug!("Ctab: No pre-computed edits available, skipping");
             return None;
         }
 
-        // Build completion context for smart differ
-        // When API provides a range, we need to include content from that range
-        // to properly detect overlaps
-        let context = if let Some((start_line_1, end_line_1)) = completion.api_range {
-            // API range is 1-indexed, convert to 0-indexed
-            let start_line_0 = (start_line_1.max(1) - 1) as u32;
-            let end_line_0 = (end_line_1.max(1) - 1) as u32;
+        // Get current buffer snapshot for interpolation
+        let current_snapshot = buffer.read(cx).snapshot();
 
-            // Build context that includes the range content
-            self.build_completion_context_with_range(
-                buffer_snapshot,
-                cursor_point,
-                cursor_offset,
-                start_line_0,
-                end_line_0,
-            )
-        } else {
-            self.build_completion_context(buffer_snapshot, cursor_point, cursor_offset)
-        };
+        // Interpolate edits to account for user typing since completion was computed
+        // This is lightweight - just anchor adjustment, no heavy computation
+        let edits = crate::snapshot_differ::interpolate_edits(
+            original_snapshot,
+            &current_snapshot,
+            precomputed_edits,
+        )?;
 
-        // DEBUG: Log context information
-        log::info!(
-            "Cometix: [DEBUG] suggest() context - cursor=({},{}), before_cursor={:?}, after_cursor={:?}",
-            cursor_point.row,
-            cursor_point.column,
-            &context.before_cursor,
-            &context.after_cursor
-        );
-        log::info!(
-            "Cometix: [DEBUG] suggest() completion_text={:?}, api_range={:?}",
-            completion_text,
-            completion.api_range
-        );
-
-        // Use SmartCompletionDiffer to process the completion
-        let differ = SmartCompletionDiffer::new();
-        let diff_result =
-            differ.extract_completion_diff(&context, completion_text, completion.api_range);
-
-        // DEBUG: Log differ result
-        log::info!(
-            "Cometix: [DEBUG] SmartDiffer result - confidence={:.3}, method={:?}, optimizations={:?}",
-            diff_result.confidence,
-            diff_result.method,
-            diff_result.optimizations
-        );
-        log::info!(
-            "Cometix: [DEBUG] SmartDiffer insert_text={:?}",
-            diff_result.insert_text
-        );
-
-        let insert_text = &diff_result.insert_text;
-        if insert_text.is_empty() {
-            log::debug!("Cometix: SmartDiffer returned empty insert_text, skipping");
+        if edits.is_empty() {
+            log::debug!("Ctab: Interpolation resulted in empty edits, skipping");
             return None;
         }
 
-        // For inline completion (ghost text), we use Supermaven's approach:
-        // Insert at cursor position with position..position range, combined with
-        // a delete_range that covers cursor to end of line for proper diff rendering.
-        //
-        // This is different from block replacement (Alt+L) which replaces entire lines.
-        let insert_text = insert_text.trim_end();
-        if insert_text.trim().is_empty() {
-            return None;
-        }
-
-        // Use completion_from_diff approach like Supermaven for proper inline rendering
-        let end_of_line = buffer_snapshot.anchor_after(language::Point::new(
-            cursor_point.row,
-            buffer_snapshot.line_len(cursor_point.row),
-        ));
-        let delete_range = cursor_position..end_of_line;
-
-        log::info!(
-            "Cometix: [DEBUG] Creating inline completion - cursor_offset={}, insert_len={}",
-            cursor_offset,
-            insert_text.len()
+        // DEBUG: Log edit info (lightweight)
+        log::debug!(
+            "Ctab: suggest() returning {} interpolated edits for completion {:?}",
+            edits.len(),
+            completion.binding_id
         );
-
-        // Generate edits using diff-based approach for proper ghost text rendering
-        let edits = self.completion_from_diff(
-            buffer_snapshot,
-            insert_text,
-            cursor_position,
-            delete_range.clone(),
-        );
-
-        // DEBUG: Log the generated edits
-        log::info!(
-            "Cometix: [DEBUG] completion_from_diff generated {} edits",
-            edits.len()
-        );
-        for (idx, (range, text)) in edits.iter().enumerate() {
-            log::info!(
-                "Cometix: [DEBUG] edit[{}]: range={}..{}, text={:?}",
-                idx,
-                range.start.to_offset(buffer_snapshot),
-                range.end.to_offset(buffer_snapshot),
-                text.as_ref()
-            );
-        }
 
         Some(EditPrediction::Local {
             id: completion
@@ -1696,223 +1726,8 @@ impl EditPredictionProvider for CtabCompletionProvider {
     }
 }
 
-impl CtabCompletionProvider {
-    /// Generate edits from completion text using diff-based approach.
-    /// This matches the buffer text against completion text to create proper inlays.
-    /// Ported from Supermaven's completion_from_diff function.
-    fn completion_from_diff(
-        &self,
-        snapshot: &language::Buffer,
-        completion_text: &str,
-        position: Anchor,
-        delete_range: std::ops::Range<Anchor>,
-    ) -> Vec<(std::ops::Range<Anchor>, Arc<str>)> {
-        let buffer_text: String = snapshot
-            .text_for_range(
-                delete_range.start.to_offset(snapshot)..delete_range.end.to_offset(snapshot),
-            )
-            .collect();
-
-        // DEBUG: Log inputs to completion_from_diff
-        log::info!(
-            "Cometix: [DEBUG] completion_from_diff - completion_text={:?}, buffer_text={:?}",
-            completion_text,
-            buffer_text
-        );
-
-        let mut edits: Vec<(std::ops::Range<Anchor>, Arc<str>)> = Vec::new();
-
-        let completion_graphemes: Vec<&str> = completion_text.graphemes(true).collect();
-        let buffer_graphemes: Vec<&str> = buffer_text.graphemes(true).collect();
-
-        let mut offset = position.to_offset(snapshot);
-
-        let mut i = 0;
-        let mut j = 0;
-        while i < completion_graphemes.len() && j < buffer_graphemes.len() {
-            // Find the next instance of the buffer text in the completion text
-            let k = completion_graphemes[i..]
-                .iter()
-                .position(|c| *c == buffer_graphemes[j]);
-            match k {
-                Some(k) => {
-                    if k != 0 {
-                        let anchor = snapshot.anchor_after(offset);
-                        // The range from current position to item is an inlay
-                        let edit = (
-                            anchor..anchor,
-                            Arc::from(completion_graphemes[i..i + k].join("")),
-                        );
-                        edits.push(edit);
-                    }
-                    i += k + 1;
-                    j += 1;
-                    offset += buffer_graphemes[j - 1].len();
-                }
-                None => {
-                    // No more matching completions, drop remaining as inlay
-                    break;
-                }
-            }
-        }
-
-        if j == buffer_graphemes.len() && i < completion_graphemes.len() {
-            let anchor = snapshot.anchor_after(offset);
-            // Leftover completion text becomes an inlay
-            let edit_range = anchor..anchor;
-            let edit_text = completion_graphemes[i..].join("");
-            edits.push((edit_range, Arc::from(edit_text)));
-        }
-
-        edits
-    }
-    /// Build completion context for SmartCompletionDiffer
-    fn build_completion_context(
-        &self,
-        buffer: &language::Buffer,
-        cursor_point: Point,
-        cursor_offset: usize,
-    ) -> CompletionContext {
-        // Get text before cursor (current line up to cursor)
-        let line_start_offset = buffer.point_to_offset(Point::new(cursor_point.row, 0));
-        let before_cursor: String = buffer
-            .chars_for_range(line_start_offset..cursor_offset)
-            .collect();
-
-        // Get text after cursor (from cursor to end of current line, plus some following lines)
-        let line_end_offset = buffer.point_to_offset(Point::new(
-            cursor_point.row,
-            buffer.line_len(cursor_point.row),
-        ));
-
-        // Include up to 10 lines after cursor for overlap detection
-        let max_line = buffer.max_point().row;
-        let context_end_line = (cursor_point.row + 10).min(max_line);
-        let context_end_offset = if context_end_line > cursor_point.row {
-            buffer.point_to_offset(Point::new(
-                context_end_line,
-                buffer.line_len(context_end_line),
-            ))
-        } else {
-            line_end_offset
-        };
-
-        let after_cursor: String = buffer
-            .chars_for_range(cursor_offset..context_end_offset)
-            .collect();
-
-        // Get current line text
-        let current_line: String = buffer
-            .chars_for_range(line_start_offset..line_end_offset)
-            .collect();
-
-        // Calculate indentation
-        let indentation: String = current_line
-            .chars()
-            .take_while(|c| c.is_whitespace())
-            .collect();
-
-        // Get language
-        let language = buffer
-            .language()
-            .map(|l| l.name().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        CompletionContext {
-            before_cursor,
-            after_cursor,
-            current_line,
-            language,
-            indentation,
-            cursor_row: cursor_point.row,
-            cursor_col: cursor_point.column,
-        }
-    }
-
-    /// Build completion context with API-specified range for proper overlap detection.
-    ///
-    /// When API returns a `range_to_replace`, the completion text is meant to replace
-    /// that entire range. We need to include content from lines BEFORE the cursor
-    /// (within that range) in `before_cursor` so the differ can detect overlaps.
-    ///
-    /// Example scenario:
-    /// - Line 42: `newTD()`  <- cursor is at end of this line or start of next
-    /// - Line 43: (empty or next statement)
-    /// - API returns: `range_to_replace=(43,43)`, `text="newTD();"`
-    /// - Without range context: before_cursor="" (cursor at line start), no overlap detected
-    /// - With range context: before_cursor includes line 42 content, overlap detected
-    fn build_completion_context_with_range(
-        &self,
-        buffer: &language::Buffer,
-        cursor_point: Point,
-        cursor_offset: usize,
-        range_start_line: u32,
-        range_end_line: u32,
-    ) -> CompletionContext {
-        let max_line = buffer.max_point().row;
-
-        // Include a few lines before the range start for better context
-        let context_start_line = range_start_line.saturating_sub(3);
-        let context_start_offset = buffer.point_to_offset(Point::new(context_start_line, 0));
-
-        // Get text before cursor, including previous lines within context
-        // This captures content that might overlap with the completion
-        let before_cursor: String = buffer
-            .chars_for_range(context_start_offset..cursor_offset)
-            .collect();
-
-        // Get text after cursor, including lines up to and beyond the range end
-        let context_end_line = (range_end_line + 5).min(max_line);
-        let context_end_offset = buffer.point_to_offset(Point::new(
-            context_end_line,
-            buffer.line_len(context_end_line),
-        ));
-
-        let after_cursor: String = buffer
-            .chars_for_range(cursor_offset..context_end_offset)
-            .collect();
-
-        // Get current line text
-        let line_start_offset = buffer.point_to_offset(Point::new(cursor_point.row, 0));
-        let line_end_offset = buffer.point_to_offset(Point::new(
-            cursor_point.row,
-            buffer.line_len(cursor_point.row),
-        ));
-        let current_line: String = buffer
-            .chars_for_range(line_start_offset..line_end_offset)
-            .collect();
-
-        // Calculate indentation
-        let indentation: String = current_line
-            .chars()
-            .take_while(|c| c.is_whitespace())
-            .collect();
-
-        // Get language
-        let language = buffer
-            .language()
-            .map(|l| l.name().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        CompletionContext {
-            before_cursor,
-            after_cursor,
-            current_line,
-            language,
-            indentation,
-            cursor_row: cursor_point.row,
-            cursor_col: cursor_point.column,
-        }
-    }
-}
-
-/// Calculates the length in bytes of the common prefix between two character iterators.
-fn common_prefix<T1: Iterator<Item = char>, T2: Iterator<Item = char>>(a: T1, b: T2) -> usize {
-    a.zip(b)
-        .take_while(|(a, b)| a == b)
-        .map(|(a, _)| a.len_utf8())
-        .sum()
-}
+// NOTE: Old completion_from_diff and build_completion_context functions removed.
+// Now using SnapshotDiffer for precise BufferSnapshot-based diff calculation.
 
 /// Generate a workspace ID for the session
 /// Generate a stable workspace ID based on workspace path

@@ -4437,7 +4437,6 @@ dependencies = [
  "settings",
  "sha2",
  "similar",
- "unicode-segmentation",
  "util",
 ]
 
