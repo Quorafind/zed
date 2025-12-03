@@ -2,8 +2,8 @@ use anyhow::Result;
 use client::{Client, UserStore, zed_urls};
 use cloud_llm_client::UsageLimit;
 use codestral::CodestralCompletionProvider;
-use cometix::CometixSettings;
 use copilot::{Copilot, Status};
+use ctab::CtabSettings;
 use editor::{
     Editor, MultiBufferOffset, SelectionEffects, actions::ShowEditPrediction, scroll::Autoscroll,
 };
@@ -454,9 +454,9 @@ impl Render for EditPredictionButton {
                 div().child(popover_menu.into_any_element())
             }
 
-            EditPredictionProvider::Cometix => {
+            EditPredictionProvider::Ctab => {
                 let enabled = self.editor_enabled.unwrap_or(true);
-                let has_auth_token = CometixSettings::get_global(cx).auth_token.is_some();
+                let has_auth_token = CtabSettings::get_global(cx).auth_token.is_some();
                 let this = cx.weak_entity();
 
                 div().child(
@@ -567,7 +567,7 @@ impl EditPredictionButton {
         }
 
         // Cometix is always available (requires auth token in settings)
-        providers.push(EditPredictionProvider::Cometix);
+        providers.push(EditPredictionProvider::Ctab);
 
         if cx.has_flag::<SweepFeatureFlag>() {
             providers.push(EditPredictionProvider::Experimental(
@@ -635,14 +635,14 @@ impl EditPredictionButton {
                             set_completion_provider(fs.clone(), cx, provider);
                         })
                     }
-                    EditPredictionProvider::Cometix => {
-                        let settings = CometixSettings::get_global(cx);
+                    EditPredictionProvider::Ctab => {
+                        let settings = CtabSettings::get_global(cx);
                         let has_auth_token = settings.auth_token.is_some();
 
                         // Only Official mode requires auth_token
                         // Self-hosted modes (Selfhosted/SelfhostedProxy) can work without auth_token
                         let requires_auth_token =
-                            matches!(settings.endpoint_type, cometix::EndpointType::Official);
+                            matches!(settings.endpoint_type, ctab::EndpointType::Official);
 
                         let entry = ContextMenuEntry::new("Cometix")
                             .when(requires_auth_token && !has_auth_token, |this| {
@@ -802,7 +802,7 @@ impl EditPredictionButton {
                 | EditPredictionProvider::Copilot
                 | EditPredictionProvider::Supermaven
                 | EditPredictionProvider::Codestral
-                | EditPredictionProvider::Cometix
+                | EditPredictionProvider::Ctab
         ) {
             menu = menu
                 .separator()
@@ -1064,17 +1064,17 @@ impl EditPredictionButton {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ContextMenu> {
-        let settings = CometixSettings::get_global(cx);
+        let settings = CtabSettings::get_global(cx);
         let has_auth_token = settings.auth_token.is_some();
         let is_selfhosted = matches!(
             settings.endpoint_type,
-            cometix::EndpointType::Selfhosted | cometix::EndpointType::SelfhostedProxy
+            ctab::EndpointType::Selfhosted | ctab::EndpointType::SelfhostedProxy
         );
 
         let endpoint_info = match settings.endpoint_type {
-            cometix::EndpointType::Official => "Official API",
-            cometix::EndpointType::SelfhostedProxy => "Self-hosted Proxy",
-            cometix::EndpointType::Selfhosted => "Self-hosted",
+            ctab::EndpointType::Official => "Official API",
+            ctab::EndpointType::SelfhostedProxy => "Self-hosted Proxy",
+            ctab::EndpointType::Selfhosted => "Self-hosted",
         };
 
         ContextMenu::build(window, cx, |menu, window, cx| {
@@ -1110,7 +1110,7 @@ impl EditPredictionButton {
             let menu = if is_selfhosted {
                 menu
             } else {
-                self.add_provider_switching_section(menu, EditPredictionProvider::Cometix, cx)
+                self.add_provider_switching_section(menu, EditPredictionProvider::Ctab, cx)
             };
 
             menu.separator()

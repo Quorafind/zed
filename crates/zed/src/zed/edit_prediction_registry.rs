@@ -1,8 +1,8 @@
 use client::{Client, UserStore};
 use codestral::CodestralCompletionProvider;
 use collections::HashMap;
-use cometix::CometixCompletionProvider;
 use copilot::{Copilot, CopilotCompletionProvider};
+use ctab::CtabCompletionProvider;
 use editor::Editor;
 use feature_flags::FeatureFlagAppExt;
 use gpui::{AnyWindowHandle, App, AppContext as _, Context, Entity, WeakEntity};
@@ -203,10 +203,10 @@ fn assign_edit_prediction_provider(
             let provider = cx.new(|_| CodestralCompletionProvider::new(http_client));
             editor.set_edit_prediction_provider(Some(provider), window, cx);
         }
-        EditPredictionProvider::Cometix => {
+        EditPredictionProvider::Ctab => {
             let http_client = client.http_client();
             let project = editor.project().cloned();
-            let provider = cx.new(|_| CometixCompletionProvider::new(http_client, project));
+            let provider = cx.new(|_| CtabCompletionProvider::new(http_client, project));
             editor.set_edit_prediction_provider(Some(provider), window, cx);
         }
         value @ (EditPredictionProvider::Experimental(_) | EditPredictionProvider::Zed) => {
