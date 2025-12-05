@@ -23,6 +23,7 @@ test-support = [
 
 [dependencies]
 anyhow.workspace = true
+clock.workspace = true
 collections.workspace = true
 edit_prediction.workspace = true
 futures.workspace = true
@@ -40,6 +41,9 @@ settings.workspace = true
 sha2.workspace = true
 hex.workspace = true
 util.workspace = true
+worktree.workspace = true
+rope.workspace = true
+regex.workspace = true
 similar = "2.6"
 prost = "0.13"
 

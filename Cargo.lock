@@ -4418,6 +4418,7 @@ name = "ctab"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clock",
  "collections",
  "edit_prediction",
  "futures 0.3.31",
@@ -4431,6 +4432,8 @@ dependencies = [
  "prost 0.13.5",
  "prost-build 0.13.5",
  "rand 0.9.2",
+ "regex",
+ "rope",
  "schemars",
  "serde",
  "serde_json",
@@ -4438,6 +4441,7 @@ dependencies = [
  "sha2",
  "similar",
  "util",
+ "worktree",
 ]
 
 [[package]]

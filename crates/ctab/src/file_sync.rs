@@ -3,7 +3,11 @@
 //! This module handles file synchronization with the Cursor API server,
 //! enabling the server to maintain an up-to-date view of the user's workspace.
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use collections::HashMap;
@@ -23,6 +27,194 @@ const CLIENT_VERSION: &str = "1.6.1-zed";
 
 /// Maximum file size to sync (in bytes)
 const MAX_FILE_SIZE_TO_SYNC: usize = 500_000;
+
+// ============================================================================
+// File Logger for FileSync debugging
+// ============================================================================
+
+/// Logger for file sync operations - writes to a dedicated log file
+pub struct FileSyncLogger {
+    log_file: Option<PathBuf>,
+}
+
+impl FileSyncLogger {
+    /// Create a new logger with the specified log file path
+    pub fn new(log_path: Option<PathBuf>) -> Self {
+        Self { log_file: log_path }
+    }
+
+    /// Get the default log file path
+    pub fn default_log_path() -> PathBuf {
+        // Use temp directory for the log file
+        let mut path = std::env::temp_dir();
+        path.push("ctab_filesync.log");
+        path
+    }
+
+    /// Log an upload request
+    pub fn log_upload_request(
+        &self,
+        uuid: &str,
+        file_path: &str,
+        content_size: usize,
+        model_version: i32,
+        hash: &str,
+    ) {
+        let msg = format!(
+            "[UPLOAD_REQ] uuid={}, path={}, size={} bytes, version={}, hash={}",
+            uuid,
+            file_path,
+            content_size,
+            model_version,
+            &hash[..16.min(hash.len())]
+        );
+        self.write_log(&msg);
+    }
+
+    /// Log an upload response
+    pub fn log_upload_response(
+        &self,
+        file_path: &str,
+        status: u16,
+        error: Option<FsUploadErrorType>,
+        response_body: Option<&[u8]>,
+    ) {
+        let error_str = match error {
+            Some(FsUploadErrorType::Unspecified) => "UNSPECIFIED (success)".to_string(),
+            Some(FsUploadErrorType::NonExistant) => "NON_EXISTANT".to_string(),
+            Some(FsUploadErrorType::HashMismatch) => "HASH_MISMATCH".to_string(),
+            None => "N/A".to_string(),
+        };
+
+        let body_preview = response_body
+            .map(|b| {
+                let preview_len = b.len().min(200);
+                String::from_utf8_lossy(&b[..preview_len]).to_string()
+            })
+            .unwrap_or_default();
+
+        let msg = format!(
+            "[UPLOAD_RSP] path={}, status={}, error={}, body_preview={}",
+            file_path, status, error_str, body_preview
+        );
+        self.write_log(&msg);
+    }
+
+    /// Log a sync request
+    pub fn log_sync_request(
+        &self,
+        uuid: &str,
+        file_path: &str,
+        model_version: i32,
+        updates_count: usize,
+        hash: &str,
+    ) {
+        let msg = format!(
+            "[SYNC_REQ] uuid={}, path={}, version={}, updates={}, hash={}",
+            uuid,
+            file_path,
+            model_version,
+            updates_count,
+            &hash[..16.min(hash.len())]
+        );
+        self.write_log(&msg);
+    }
+
+    /// Log a sync response
+    pub fn log_sync_response(&self, file_path: &str, status: u16, error: Option<FsSyncErrorType>) {
+        let error_str = match error {
+            Some(FsSyncErrorType::Unspecified) => "UNSPECIFIED (success)".to_string(),
+            Some(FsSyncErrorType::NonExistant) => "NON_EXISTANT".to_string(),
+            Some(FsSyncErrorType::HashMismatch) => "HASH_MISMATCH".to_string(),
+            None => "N/A".to_string(),
+        };
+
+        let msg = format!(
+            "[SYNC_RSP] path={}, status={}, error={}",
+            file_path, status, error_str
+        );
+        self.write_log(&msg);
+    }
+
+    /// Log a file change record
+    pub fn log_change_record(
+        &self,
+        file_path: &str,
+        start_offset: usize,
+        end_offset: usize,
+        new_text_len: usize,
+        model_version: i32,
+    ) {
+        let msg = format!(
+            "[CHANGE] path={}, offset={}..{}, new_len={}, version={}",
+            file_path, start_offset, end_offset, new_text_len, model_version
+        );
+        self.write_log(&msg);
+    }
+
+    /// Log general file sync status
+    pub fn log_status(
+        &self,
+        file_path: &str,
+        is_uploaded: bool,
+        model_version: i32,
+        pending_updates: usize,
+    ) {
+        let msg = format!(
+            "[STATUS] path={}, uploaded={}, version={}, pending_updates={}",
+            file_path, is_uploaded, model_version, pending_updates
+        );
+        self.write_log(&msg);
+    }
+
+    /// Log server capability analysis
+    pub fn log_capability_analysis(
+        &self,
+        file_path: &str,
+        rely_on_filesync: bool,
+        filesync_updates_count: usize,
+        content_size: usize,
+    ) {
+        let msg = format!(
+            "[CAPABILITY] path={}, rely_on_filesync={}, filesync_updates={}, content_size={}",
+            file_path, rely_on_filesync, filesync_updates_count, content_size
+        );
+        self.write_log(&msg);
+    }
+
+    fn write_log(&self, message: &str) {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        let formatted = format!("[{:.3}] {}\n", timestamp, message);
+
+        // Always log to standard log
+        log::info!("Ctab FileSync: {}", message);
+
+        // Also write to file if configured
+        if let Some(ref log_path) = self.log_file {
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+                let _ = file.write_all(formatted.as_bytes());
+            }
+        }
+    }
+}
+
+impl Default for FileSyncLogger {
+    fn default() -> Self {
+        Self::new(Some(Self::default_log_path()))
+    }
+}
+
+/// Global file sync logger instance
+static FILE_SYNC_LOGGER: std::sync::OnceLock<FileSyncLogger> = std::sync::OnceLock::new();
+
+/// Get the global file sync logger
+pub fn get_filesync_logger() -> &'static FileSyncLogger {
+    FILE_SYNC_LOGGER.get_or_init(|| FileSyncLogger::default())
+}
 
 /// Tracks the sync state of a single file
 #[derive(Clone, Debug)]
@@ -80,6 +272,8 @@ impl FileSyncManager {
         base_url: String,
         upload_path: &'static str,
     ) -> Result<FsUploadErrorType> {
+        let logger = get_filesync_logger();
+
         // Skip large files
         if contents.len() > MAX_FILE_SIZE_TO_SYNC {
             log::debug!(
@@ -87,11 +281,15 @@ impl FileSyncManager {
                 file_path,
                 contents.len()
             );
+            logger.log_status(&file_path, false, model_version, 0);
             return Ok(FsUploadErrorType::Unspecified);
         }
 
         let url = format!("{}{}", base_url, upload_path);
         let hash = Self::compute_sha256(&contents);
+
+        // Log upload request
+        logger.log_upload_request(&uuid, &file_path, contents.len(), model_version, &hash);
 
         log::debug!(
             "Cometix: Uploading file {} (version={}, size={}, hash={})",
@@ -137,10 +335,21 @@ impl FileSyncManager {
                 status,
                 error_text
             );
+            // Log failed response
+            logger.log_upload_response(&file_path, status.as_u16(), None, Some(&body_bytes));
             anyhow::bail!("File upload failed: {}", status);
         }
 
         let response = FsUploadFileResponse::decode(&body_bytes[..])?;
+
+        // Log successful response
+        logger.log_upload_response(
+            &file_path,
+            status.as_u16(),
+            Some(response.error()),
+            Some(&body_bytes),
+        );
+
         log::debug!(
             "Cometix: File upload completed for {} - error={:?}",
             file_path,
@@ -167,7 +376,17 @@ impl FileSyncManager {
         base_url: String,
         sync_path: &'static str,
     ) -> Result<FsSyncErrorType> {
+        let logger = get_filesync_logger();
         let url = format!("{}{}", base_url, sync_path);
+
+        // Log sync request
+        logger.log_sync_request(
+            &uuid,
+            &file_path,
+            model_version,
+            updates.len(),
+            &content_hash,
+        );
 
         log::debug!(
             "Cometix: Syncing file {} (version={}, updates={}, hash={})",
@@ -213,11 +432,16 @@ impl FileSyncManager {
                 status,
                 error_text
             );
+            // Log failed response
+            logger.log_sync_response(&file_path, status.as_u16(), None);
             anyhow::bail!("File sync failed: {}", status);
         }
 
         // Parse response
         if let Ok(response) = FsSyncFileResponse::decode(&body_bytes[..]) {
+            // Log successful response
+            logger.log_sync_response(&file_path, status.as_u16(), Some(response.error()));
+
             log::debug!(
                 "Cometix: File sync completed for {} - error={:?}",
                 file_path,
@@ -225,6 +449,9 @@ impl FileSyncManager {
             );
             return Ok(response.error());
         }
+
+        // Log response without parsed error
+        logger.log_sync_response(&file_path, status.as_u16(), None);
 
         Ok(FsSyncErrorType::Unspecified)
     }
@@ -265,6 +492,16 @@ impl FileSyncManager {
                 end_column: end_col,
             }),
         });
+
+        // Log change record
+        let logger = get_filesync_logger();
+        logger.log_change_record(
+            file_path,
+            start_offset,
+            end_offset,
+            new_text.len(),
+            state.model_version,
+        );
     }
 
     /// Gets the current model version for a file

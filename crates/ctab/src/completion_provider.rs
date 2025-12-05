@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use clock;
 use edit_prediction::{Direction, EditPrediction, EditPredictionProvider};
 use futures::AsyncReadExt;
 use gpui::{App, Context, Entity, EntityId, SharedString, Task};
@@ -22,12 +23,13 @@ use crate::CtabSettings;
 use crate::diff_tracker::DiffTracker;
 use crate::file_sync::FileSyncManager;
 use crate::proto::{
-    AdditionalFile, CppAppendRequest, CppConfigRequest, CppConfigResponse, CppContextItem, CppFate,
-    CppFileDiffHistory, CppIntentInfo, CurrentFileInfo, CursorPosition, CursorRange,
-    Diagnostic as ProtoDiagnostic, FilesyncUpdateWithModelVersion, FsUploadErrorType,
-    RecordCppFateRequest, StreamCppRequest, StreamCppResponse,
-    diagnostic::DiagnosticSeverity as ProtoDiagnosticSeverity,
+    CodeBlock, CodeResult, CppAppendRequest, CppConfigRequest, CppConfigResponse, CppContextItem,
+    CppFate, CppFileDiffHistory, CppIntentInfo, CppParameterHint, CurrentFileInfo, CursorPosition,
+    CursorRange, Diagnostic as ProtoDiagnostic, FilesyncUpdateWithModelVersion, FsUploadErrorType,
+    LspSubgraphFullContext, LspSuggestedItems, LspSuggestion, RecordCppFateRequest,
+    StreamCppRequest, StreamCppResponse, diagnostic::DiagnosticSeverity as ProtoDiagnosticSeverity,
 };
+use crate::smart_context::SmartContextEngine;
 use crate::snapshot_differ::SnapshotDiffer;
 use project::Project;
 
@@ -37,11 +39,7 @@ const CONFIG_CACHE_TTL_SECS: u64 = 300;
 /// Client version to report
 const CLIENT_VERSION: &str = "1.6.1-zed";
 
-/// Maximum number of additional files to include in context
-const MAX_ADDITIONAL_FILES: usize = 10;
-
-/// Maximum content size per additional file (in bytes)
-const MAX_ADDITIONAL_FILE_SIZE: usize = 50_000;
+// Note: MAX_ADDITIONAL_FILES and MAX_ADDITIONAL_FILE_SIZE moved to smart_context.rs
 
 /// Cached server configuration
 #[derive(Clone, Debug)]
@@ -62,6 +60,8 @@ pub struct CtabCompletionProvider {
     diff_tracker: Arc<Mutex<DiffTracker>>,
     config_cache: Arc<Mutex<Option<CachedConfig>>>,
     file_sync_manager: Arc<FileSyncManager>,
+    /// Smart context engine for intelligent context collection
+    smart_context: SmartContextEngine,
     buffer_id: Option<EntityId>,
     file_extension: Option<String>,
     current_file_path: Option<String>,
@@ -74,6 +74,11 @@ pub struct CtabCompletionProvider {
     filesync_cookie: String,
     /// Whether to skip the next refresh request (used when completion indicates no retrigger)
     skip_next_refresh: bool,
+    /// Followup edits queue for multidiff support
+    followup_session: Option<FollowupSession>,
+    /// Model info from server (fused cursor prediction, multidiff support)
+    is_fused_cursor_prediction_model: bool,
+    is_multidiff_model: bool,
 }
 
 struct CompletionState {
@@ -92,6 +97,63 @@ struct CompletionState {
     precomputed_edits: Option<Vec<(std::ops::Range<Anchor>, Arc<str>)>>,
     /// Original buffer snapshot when edits were computed (for interpolation)
     original_snapshot: Option<BufferSnapshot>,
+    /// Cursor prediction target from server response
+    cursor_prediction: Option<CursorPredictionTarget>,
+    /// Whether this is from a fused cursor prediction model
+    is_fused_model: bool,
+    /// Whether the model supports multidiff
+    is_multidiff_model: bool,
+    /// Preloaded jump target for cross-file cursor prediction
+    /// Contains (snapshot, target_anchor) if prediction targets a different file
+    jump_target: Option<(BufferSnapshot, Anchor)>,
+}
+
+/// Cursor prediction target information
+#[derive(Clone, Debug)]
+pub struct CursorPredictionTarget {
+    /// Relative path to the predicted file
+    pub relative_path: String,
+    /// Line number (1-indexed)
+    pub line_number_one_indexed: i32,
+    /// Expected content at the target location
+    pub expected_content: String,
+    /// Whether to retrigger CPP after jumping
+    pub should_retrigger_cpp: bool,
+}
+
+/// A single edit part from multidiff stream
+#[derive(Clone, Debug)]
+struct EditPart {
+    /// Line range (1-indexed, from server)
+    range: (i32, i32),
+    /// Edit text content
+    text: String,
+    /// Binding ID for this edit
+    binding_id: Option<String>,
+    /// Whether to trim leading EOL
+    should_trim_leading: bool,
+}
+
+/// Followup session for multidiff edits
+struct FollowupSession {
+    /// Document path
+    document_path: String,
+    /// Queued edits
+    queue: Vec<EditPart>,
+    /// Buffer version when followups were cached
+    buffer_version: clock::Global,
+}
+
+/// Parsed result from multidiff streaming response
+#[derive(Debug)]
+struct MultidiffParseResult {
+    /// All edit parts from the stream
+    edits: Vec<EditPart>,
+    /// Cursor prediction target (if any)
+    cursor_prediction: Option<CursorPredictionTarget>,
+    /// Model info
+    is_fused_model: bool,
+    is_multidiff_model: bool,
 }
 
 impl CtabCompletionProvider {
@@ -100,10 +162,11 @@ impl CtabCompletionProvider {
         let workspace_id = generate_workspace_id();
         Self {
             http_client: http_client.clone(),
-            project,
+            project: project.clone(),
             diff_tracker: Arc::new(Mutex::new(DiffTracker::new())),
             config_cache: Arc::new(Mutex::new(None)),
             file_sync_manager: Arc::new(FileSyncManager::new(http_client, workspace_id.clone())),
+            smart_context: SmartContextEngine::new(project),
             buffer_id: None,
             file_extension: None,
             current_file_path: None,
@@ -113,6 +176,9 @@ impl CtabCompletionProvider {
             filesync_client_key: generate_filesync_client_key(),
             filesync_cookie: generate_filesync_cookie(),
             skip_next_refresh: false,
+            followup_session: None,
+            is_fused_cursor_prediction_model: true, // Default to true (most models now support this)
+            is_multidiff_model: true,               // Default to true
         }
     }
 
@@ -338,6 +404,121 @@ impl CtabCompletionProvider {
         Self::parse_streaming_response(&body_bytes)
     }
 
+    /// Fetches completion with multidiff support.
+    ///
+    /// Returns a MultidiffParseResult containing all edits and cursor prediction.
+    async fn fetch_completion_multidiff(
+        http_client: Arc<dyn HttpClient>,
+        request: StreamCppRequest,
+        auth_token: String,
+        client_key: String,
+        client_key_header: String,
+        filesync_client_key: String,
+        filesync_cookie: String,
+        base_url: String,
+        stream_path: &'static str,
+        uses_connect_rpc: bool,
+    ) -> Result<MultidiffParseResult> {
+        let url = format!("{}{}", base_url, stream_path);
+
+        log::info!("Ctab: [Multidiff] Sending request to {}", url);
+
+        let proto_body = request.encode_to_vec();
+
+        // Connect RPC requires envelope format: [flags(1)][length(4)][payload]
+        let body = if uses_connect_rpc {
+            let mut envelope = Vec::with_capacity(5 + proto_body.len());
+            envelope.push(0u8);
+            envelope.extend_from_slice(&(proto_body.len() as u32).to_be_bytes());
+            envelope.extend_from_slice(&proto_body);
+            envelope
+        } else {
+            proto_body
+        };
+
+        let content_type = if uses_connect_rpc {
+            "application/connect+proto"
+        } else {
+            "application/proto"
+        };
+
+        let http_request = http_client::Request::builder()
+            .method(Method::POST)
+            .uri(&url)
+            .header("Content-Type", content_type)
+            .header("Connect-Protocol-Version", "1")
+            .header("Authorization", format!("Bearer {}", auth_token))
+            .header(&client_key_header, &client_key)
+            .header("x-client-key", &filesync_client_key)
+            .header("x-fs-client-key", &filesync_client_key)
+            .header("Cookie", format!("FilesyncCookie={}", filesync_cookie))
+            .header("x-cursor-client-version", CLIENT_VERSION)
+            .header("User-Agent", "connectrpc/1.6.1")
+            .body(AsyncBody::from(body))?;
+
+        let mut response = http_client.send(http_request).await?;
+        let status = response.status();
+
+        log::info!("Ctab: [Multidiff] Response status: {}", status);
+
+        // Handle 204 No Content
+        if status.as_u16() == 204 {
+            log::info!("Ctab: [Multidiff] Server returned 204 No Content");
+            return Ok(MultidiffParseResult {
+                edits: vec![],
+                cursor_prediction: None,
+                is_fused_model: true,
+                is_multidiff_model: true,
+            });
+        }
+
+        let mut body_bytes = Vec::new();
+        response.body_mut().read_to_end(&mut body_bytes).await?;
+
+        if !status.is_success() {
+            let error_text = String::from_utf8_lossy(&body_bytes);
+            anyhow::bail!("Request failed with status {}: {}", status, error_text);
+        }
+
+        if body_bytes.is_empty() {
+            return Ok(MultidiffParseResult {
+                edits: vec![],
+                cursor_prediction: None,
+                is_fused_model: true,
+                is_multidiff_model: true,
+            });
+        }
+
+        // Check if response is JSON (some endpoints return JSON instead of proto)
+        if body_bytes.first() == Some(&b'{') {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                let text = json.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let binding_id = json
+                    .get("bindingId")
+                    .or_else(|| json.get("binding_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                if !text.is_empty() {
+                    return Ok(MultidiffParseResult {
+                        edits: vec![EditPart {
+                            range: (1, 1), // Fallback range
+                            text: text.to_string(),
+                            binding_id,
+                            should_trim_leading: false,
+                        }],
+                        cursor_prediction: None,
+                        is_fused_model: true,
+                        is_multidiff_model: true,
+                    });
+                }
+            }
+        }
+
+        // Parse with multidiff support
+        Self::parse_streaming_response_multidiff(&body_bytes)
+    }
+
     /// Parses gRPC-Web Length-Prefixed Messages from response body.
     ///
     /// Format: [1-byte flag][4-byte big-endian length][payload]...
@@ -466,6 +647,213 @@ impl CtabCompletionProvider {
             should_remove_leading_eol: final_should_remove_leading_eol,
             done_stream: Some(true),
             ..Default::default()
+        })
+    }
+
+    /// Parses gRPC-Web streaming response with multidiff support.
+    ///
+    /// This enhanced parser handles `begin_edit`/`done_edit` boundaries
+    /// to extract multiple edits from a single stream response.
+    fn parse_streaming_response_multidiff(body: &[u8]) -> Result<MultidiffParseResult> {
+        const HEADER_SIZE: usize = 5;
+
+        let mut edits: Vec<EditPart> = Vec::new();
+        let mut current_text = String::new();
+        let mut current_range: Option<(i32, i32)> = None;
+        let mut current_binding_id: Option<String> = None;
+        let mut current_should_trim_leading = false;
+
+        let mut cursor_prediction: Option<CursorPredictionTarget> = None;
+        let mut is_fused_model = true;
+        let mut is_multidiff_model = true;
+
+        let mut offset = 0;
+        let mut message_count = 0;
+        let mut in_edit = false;
+
+        log::info!(
+            "Ctab: [Multidiff] Starting to parse {} bytes of response",
+            body.len()
+        );
+
+        // Helper to flush current edit
+        let flush_edit = |edits: &mut Vec<EditPart>,
+                          text: &mut String,
+                          range: &mut Option<(i32, i32)>,
+                          binding_id: &mut Option<String>,
+                          should_trim: &mut bool| {
+            if let Some(r) = range.take() {
+                let mut edit_text = std::mem::take(text);
+                if *should_trim {
+                    edit_text = edit_text
+                        .strip_prefix('\n')
+                        .or_else(|| edit_text.strip_prefix("\r\n"))
+                        .map(|s| s.to_string())
+                        .unwrap_or(edit_text);
+                }
+                if !edit_text.is_empty() || r.0 != r.1 {
+                    log::info!(
+                        "Ctab: [Multidiff] Flushing edit: lines {}-{}, text_len={}",
+                        r.0,
+                        r.1,
+                        edit_text.len()
+                    );
+                    edits.push(EditPart {
+                        range: r,
+                        text: edit_text,
+                        binding_id: binding_id.take(),
+                        should_trim_leading: *should_trim,
+                    });
+                }
+                *should_trim = false;
+            } else {
+                text.clear();
+            }
+        };
+
+        while offset + HEADER_SIZE <= body.len() {
+            let flags = body[offset];
+            let length = u32::from_be_bytes([
+                body[offset + 1],
+                body[offset + 2],
+                body[offset + 3],
+                body[offset + 4],
+            ]) as usize;
+
+            message_count += 1;
+            offset += HEADER_SIZE;
+
+            if offset + length > body.len() {
+                log::warn!(
+                    "Ctab: [Multidiff] Incomplete message #{} - expected {} bytes",
+                    message_count,
+                    length
+                );
+                break;
+            }
+
+            // flags=2 indicates end-of-stream (trailers)
+            if flags == 2 {
+                offset += length;
+                continue;
+            }
+
+            let payload = &body[offset..offset + length];
+            match StreamCppResponse::decode(payload) {
+                Ok(msg) => {
+                    // Handle begin_edit: signals start of a new edit
+                    if msg.begin_edit.unwrap_or(false) {
+                        log::info!(
+                            "Ctab: [Multidiff] begin_edit received (edit #{})",
+                            edits.len() + 1
+                        );
+                        // Flush any pending edit before starting new one
+                        if in_edit {
+                            flush_edit(
+                                &mut edits,
+                                &mut current_text,
+                                &mut current_range,
+                                &mut current_binding_id,
+                                &mut current_should_trim_leading,
+                            );
+                        }
+                        in_edit = true;
+                    }
+
+                    // Accumulate text
+                    current_text.push_str(&msg.text);
+
+                    // Update range if provided
+                    if let Some(ref range) = msg.range_to_replace {
+                        current_range =
+                            Some((range.start_line_number, range.end_line_number_inclusive));
+                    }
+
+                    // Update binding_id
+                    if msg.binding_id.is_some() {
+                        current_binding_id = msg.binding_id.clone();
+                    }
+
+                    // Update should_remove_leading_eol
+                    if msg.should_remove_leading_eol.unwrap_or(false) {
+                        current_should_trim_leading = true;
+                    }
+
+                    // Handle model_info
+                    if let Some(ref info) = msg.model_info {
+                        is_fused_model = info.is_fused_cursor_prediction_model;
+                        is_multidiff_model = info.is_multidiff_model;
+                        log::info!(
+                            "Ctab: [Multidiff] Model info: fused={}, multidiff={}",
+                            is_fused_model,
+                            is_multidiff_model
+                        );
+                    }
+
+                    // Handle cursor prediction target
+                    if let Some(ref target) = msg.cursor_prediction_target {
+                        log::info!(
+                            "Ctab: [Multidiff] Cursor prediction: {}:{}",
+                            target.relative_path,
+                            target.line_number_one_indexed
+                        );
+                        cursor_prediction = Some(CursorPredictionTarget {
+                            relative_path: target.relative_path.clone(),
+                            line_number_one_indexed: target.line_number_one_indexed,
+                            expected_content: target.expected_content.clone(),
+                            should_retrigger_cpp: target.should_retrigger_cpp,
+                        });
+                    }
+
+                    // Handle done_edit: signals end of current edit
+                    if msg.done_edit.unwrap_or(false) {
+                        log::info!("Ctab: [Multidiff] done_edit received");
+                        flush_edit(
+                            &mut edits,
+                            &mut current_text,
+                            &mut current_range,
+                            &mut current_binding_id,
+                            &mut current_should_trim_leading,
+                        );
+                        in_edit = false;
+                    }
+
+                    // Check for stream termination
+                    if msg.done_stream.unwrap_or(false) {
+                        log::info!("Ctab: [Multidiff] Stream completed");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Ctab: [Multidiff] Failed to decode message: {}", e);
+                }
+            }
+
+            offset += length;
+        }
+
+        // Flush any remaining edit
+        if !current_text.is_empty() || current_range.is_some() {
+            flush_edit(
+                &mut edits,
+                &mut current_text,
+                &mut current_range,
+                &mut current_binding_id,
+                &mut current_should_trim_leading,
+            );
+        }
+
+        log::info!(
+            "Ctab: [Multidiff] Parsed {} edits, cursor_prediction={:?}",
+            edits.len(),
+            cursor_prediction.as_ref().map(|p| &p.relative_path)
+        );
+
+        Ok(MultidiffParseResult {
+            edits,
+            cursor_prediction,
+            is_fused_model,
+            is_multidiff_model,
         })
     }
 
@@ -709,6 +1097,13 @@ impl CtabCompletionProvider {
         let mut body_bytes = Vec::new();
         response.body_mut().read_to_end(&mut body_bytes).await?;
 
+        log::debug!(
+            "Cometix: CppConfig response - status={}, body_len={}, body_preview={:?}",
+            status,
+            body_bytes.len(),
+            String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(200)])
+        );
+
         if !status.is_success() {
             let error_text = String::from_utf8_lossy(&body_bytes);
             log::warn!(
@@ -719,7 +1114,24 @@ impl CtabCompletionProvider {
             anyhow::bail!("CppConfig request failed: {}", status);
         }
 
-        let config = CppConfigResponse::decode(&body_bytes[..])?;
+        // Handle empty response gracefully
+        if body_bytes.is_empty() {
+            log::warn!("Cometix: CppConfig returned empty response, using defaults");
+            return Ok(CppConfigResponse::default());
+        }
+
+        let config = match CppConfigResponse::decode(&body_bytes[..]) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!(
+                    "Cometix: CppConfig decode failed ({}), raw bytes: {:?}",
+                    e,
+                    &body_bytes[..body_bytes.len().min(50)]
+                );
+                // Return default config instead of failing
+                return Ok(CppConfigResponse::default());
+            }
+        };
         log::info!(
             "Cometix: Received CppConfig - is_on={:?}, debounce={}ms, geo_url={:?}",
             config.is_on,
@@ -728,9 +1140,9 @@ impl CtabCompletionProvider {
         );
 
         // Phase 3: Log enhanced config fields if present
-        if config.allows_tab_chunks.is_some() || config.tab_context_refresh_debounce_ms.is_some() {
+        if config.allows_tab_chunks || config.tab_context_refresh_debounce_ms.is_some() {
             log::info!(
-                "Cometix: Enhanced config - allows_tab_chunks={:?}, tab_refresh_debounce_ms={:?}, editor_change_debounce_ms={:?}",
+                "Cometix: Enhanced config - allows_tab_chunks={}, tab_refresh_debounce_ms={:?}, editor_change_debounce_ms={:?}",
                 config.allows_tab_chunks,
                 config.tab_context_refresh_debounce_ms,
                 config.tab_context_refresh_editor_change_debounce_ms
@@ -889,234 +1301,110 @@ impl CtabCompletionProvider {
         })
     }
 
-    /// Strategy:
-    /// 1. Get all open buffers from the project
-    /// 2. Filter out the current file and files that are too large
-    /// 3. Prioritize files with the same language/extension as current file
-    /// 4. Limit to MAX_ADDITIONAL_FILES
+    /// Check if there are followup edits available
+    pub fn has_followup_edits(&self) -> bool {
+        self.followup_session
+            .as_ref()
+            .map(|s| !s.queue.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Get the number of remaining followup edits
+    pub fn followup_count(&self) -> usize {
+        self.followup_session
+            .as_ref()
+            .map(|s| s.queue.len())
+            .unwrap_or(0)
+    }
+
+    /// Get cursor prediction target if available
+    pub fn get_cursor_prediction(&self) -> Option<&CursorPredictionTarget> {
+        self.current_completion
+            .as_ref()
+            .and_then(|c| c.cursor_prediction.as_ref())
+    }
+
+    /// Try to preload the target buffer for cross-file cursor prediction
     ///
-    /// Note: True MRU ordering would require tracking buffer access times
-    /// at the Workspace/Pane level, which is not currently accessible here.
-    /// We use a heuristic that prioritizes same-language files instead.
-    /// Collects additional files and context items from the project for context.
-    ///
-    /// Returns a tuple of (additional_files, context_items):
-    /// - additional_files: Used for session state tracking
-    /// - context_items: Used for RAG-based code context (primary source for model)
-    /// Phase 2: Enhanced context collection with relevance scoring
-    ///
-    /// Scoring factors:
-    /// - Same language extension: +10.0
-    /// - Same directory: +5.0
-    /// - Parent/sibling directory: +2.0
-    /// - File name referenced in current content: +50.0 (import/use detection)
-    /// - Token overlap (Jaccard similarity): up to +20.0
-    fn collect_additional_files(
-        &self,
-        current_file_path: &str,
-        cx: &App,
-    ) -> (Vec<AdditionalFile>, Vec<CppContextItem>) {
-        let Some(project) = &self.project else {
-            log::debug!("Cometix: No project available for additional files");
-            return (vec![], vec![]);
-        };
+    /// This is called synchronously during refresh when a cross-file prediction is detected.
+    /// It attempts to find an already-open buffer for the target file.
+    /// If the buffer isn't open, returns None (we don't want to block on file I/O).
+    fn try_preload_jump_target(
+        project: &Entity<Project>,
+        relative_path: &str,
+        line_number_one_indexed: i32,
+        cx: &mut App,
+    ) -> Option<(BufferSnapshot, Anchor)> {
+        use project::ProjectPath;
+        use util::paths::PathStyle;
+        use util::rel_path::RelPath;
 
-        let project = project.read(cx);
+        let project_ref = project.read(cx);
 
-        // Get current file info for scoring
-        let current_ext = current_file_path
-            .rsplit('.')
-            .next()
-            .map(|s| s.to_lowercase());
-
-        let current_dir = std::path::Path::new(current_file_path)
-            .parent()
-            .map(|p| p.to_string_lossy().to_string());
-
-        let current_parent_dir = std::path::Path::new(current_file_path)
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_string_lossy().to_string());
-
-        // Get current file content for reference detection (we'll fetch it from buffer)
-        let current_content = project
-            .opened_buffers(cx)
-            .into_iter()
-            .find(|b| {
-                b.read(cx)
-                    .file()
-                    .map(|f| f.path().as_unix_str().to_string() == current_file_path)
-                    .unwrap_or(false)
-            })
-            .map(|b| b.read(cx).text())
-            .unwrap_or_default();
-
-        // Extract tokens from current content for Jaccard similarity
-        let current_tokens: std::collections::HashSet<&str> = current_content
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|s| s.len() > 2) // Filter out very short tokens
-            .collect();
-
-        // Collect scored files
-        struct ScoredFile {
-            additional_file: AdditionalFile,
-            context_item: CppContextItem,
-            score: f32,
-        }
-
-        let mut scored_files: Vec<ScoredFile> = Vec::new();
-
-        let now_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-
-        for buffer in project.opened_buffers(cx) {
-            let buffer = buffer.read(cx);
-
-            // Get file path
-            let Some(file) = buffer.file() else {
-                continue;
+        // Try to convert relative_path to RelPath
+        let target_rel_path =
+            match RelPath::new(std::path::Path::new(relative_path), PathStyle::Posix) {
+                Ok(path) => path.into_owned(),
+                Err(e) => {
+                    log::debug!(
+                        "Ctab: [CursorPrediction] Invalid path '{}': {}",
+                        relative_path,
+                        e
+                    );
+                    return None;
+                }
             };
 
-            let file_path = file.path().as_unix_str().to_string();
+        // Try to find the target file in any worktree
+        for worktree in project_ref.worktrees(cx) {
+            let worktree_ref = worktree.read(cx);
+            let worktree_id = worktree_ref.id();
 
-            // Skip the current file
-            if file_path == current_file_path {
-                continue;
-            }
+            // Check if the file exists in this worktree
+            if worktree_ref.entry_for_path(&target_rel_path).is_some() {
+                let project_path = ProjectPath {
+                    worktree_id,
+                    path: target_rel_path.into(),
+                };
 
-            // Get buffer content
-            let content = buffer.text();
+                // Check if buffer is already open (don't block on file I/O)
+                if let Some(buffer) = project_ref.get_open_buffer(&project_path, cx) {
+                    let buffer_ref = buffer.read(cx);
+                    let snapshot = buffer_ref.snapshot();
 
-            // Skip empty or too large files
-            if content.is_empty() || content.len() > MAX_ADDITIONAL_FILE_SIZE {
-                log::debug!(
-                    "Cometix: Skipping file {} (empty={}, size={})",
-                    file_path,
-                    content.is_empty(),
-                    content.len()
-                );
-                continue;
-            }
+                    // Convert 1-indexed line number to 0-indexed and create anchor
+                    let line = (line_number_one_indexed - 1).max(0) as u32;
+                    let point = Point::new(line, 0);
 
-            // Calculate relevance score
-            let mut score: f32 = 0.0;
+                    // Ensure point is within buffer bounds
+                    let clamped_point = snapshot.clip_point(point, language::Bias::Left);
+                    let target_anchor = snapshot.anchor_before(clamped_point);
 
-            // 1. Same language extension: +10.0
-            let file_ext = file_path.rsplit('.').next().map(|s| s.to_lowercase());
-            if file_ext == current_ext {
-                score += 10.0;
-            }
+                    log::info!(
+                        "Ctab: [CursorPrediction] Preloaded jump target: {}:{} -> anchor at {:?}",
+                        relative_path,
+                        line_number_one_indexed,
+                        clamped_point
+                    );
 
-            // 2. Directory proximity
-            let file_dir = std::path::Path::new(&file_path)
-                .parent()
-                .map(|p| p.to_string_lossy().to_string());
-            let file_parent_dir = std::path::Path::new(&file_path)
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|p| p.to_string_lossy().to_string());
-
-            if file_dir == current_dir {
-                // Same directory: +5.0
-                score += 5.0;
-            } else if file_parent_dir == current_parent_dir || file_dir == current_parent_dir {
-                // Sibling or parent directory: +2.0
-                score += 2.0;
-            }
-
-            // 3. File name referenced in current content: +50.0
-            // Check if the file stem (e.g., "utils" from "utils.rs") appears in current content
-            let file_stem = std::path::Path::new(&file_path)
-                .file_stem()
-                .and_then(|s| s.to_str());
-            if let Some(stem) = file_stem {
-                if stem.len() > 2 && current_content.contains(stem) {
-                    score += 50.0;
+                    return Some((snapshot, target_anchor));
+                } else {
                     log::debug!(
-                        "Cometix: File {} referenced in current content (+50)",
-                        file_path
+                        "Ctab: [CursorPrediction] Target buffer not open: {}",
+                        relative_path
                     );
                 }
+
+                // Only check first matching worktree
+                break;
             }
-
-            // 4. Token overlap (Jaccard similarity): up to +20.0
-            // Only compute for reasonably-sized files to avoid performance issues
-            if content.len() < 15_000 && !current_tokens.is_empty() {
-                let file_tokens: std::collections::HashSet<&str> = content
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .filter(|s| s.len() > 2)
-                    .collect();
-
-                if !file_tokens.is_empty() {
-                    let intersection = current_tokens.intersection(&file_tokens).count();
-                    let union = current_tokens.len() + file_tokens.len() - intersection;
-                    if union > 0 {
-                        let jaccard = intersection as f32 / union as f32;
-                        score += jaccard * 20.0;
-                    }
-                }
-            }
-
-            // Build visible range content (full file for now)
-            let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-            let total_lines = lines.len() as i32;
-
-            let additional_file = AdditionalFile {
-                relative_workspace_path: file_path.clone(),
-                is_open: true,
-                visible_range_content: lines,
-                last_viewed_at: Some(now_timestamp),
-                start_line_number_one_indexed: vec![1],
-                visible_ranges: vec![crate::proto::LineRange {
-                    start_line_number: 1,
-                    end_line_number_inclusive: total_lines,
-                }],
-            };
-
-            // Build context item for RAG context with computed score
-            let context_item = CppContextItem {
-                contents: content,
-                symbol: None,
-                relative_workspace_path: file_path.clone(),
-                score,
-            };
-
-            scored_files.push(ScoredFile {
-                additional_file,
-                context_item,
-                score,
-            });
         }
 
-        // Sort by score descending
-        scored_files.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Limit to MAX_ADDITIONAL_FILES
-        scored_files.truncate(MAX_ADDITIONAL_FILES);
-
-        log::info!(
-            "Cometix: Collected {} additional files (scores: {})",
-            scored_files.len(),
-            scored_files
-                .iter()
-                .map(|f| format!("{:.1}", f.score))
-                .collect::<Vec<_>>()
-                .join(", ")
+        log::debug!(
+            "Ctab: [CursorPrediction] Target file not found in worktrees: {}",
+            relative_path
         );
-
-        // Split into separate vectors
-        let (additional_files, context_items): (Vec<_>, Vec<_>) = scored_files
-            .into_iter()
-            .map(|sf| (sf.additional_file, sf.context_item))
-            .unzip();
-
-        (additional_files, context_items)
+        None
     }
 }
 
@@ -1163,9 +1451,77 @@ impl EditPredictionProvider for CtabCompletionProvider {
 
         // Check if we should skip this refresh (e.g., previous completion indicated no retrigger)
         if self.skip_next_refresh {
-            log::debug!("Cometix: Skipping refresh (requested by previous completion)");
+            log::debug!("Ctab: Skipping refresh (requested by previous completion)");
             self.skip_next_refresh = false;
             return;
+        }
+
+        // PRIORITY 1: Check for cached followup edits from previous multidiff stream
+        // Followup edits take priority because they are the "next edit" the user expects
+        if let Some(ref mut session) = self.followup_session {
+            if !session.queue.is_empty() {
+                let buffer_ref = buffer.read(cx);
+                let current_version = buffer_ref.version();
+
+                // Check if buffer version has changed since followups were cached
+                // If the version has changed, invalidate followups to avoid stale edits
+                if current_version.changed_since(&session.buffer_version) {
+                    // Buffer has changed, invalidate followups
+                    log::info!("Ctab: [Multidiff] Clearing stale followup cache (buffer changed)");
+                    self.followup_session = None;
+                } else {
+                    // Use next followup edit
+                    let next_edit = session.queue.remove(0);
+                    log::info!(
+                        "Ctab: [Multidiff] Using cached followup edit ({} remaining)",
+                        session.queue.len()
+                    );
+
+                    // Pre-compute edits for the followup
+                    let buffer_snapshot = buffer_ref.snapshot();
+                    let cursor_offset = cursor_position.to_offset(&buffer_snapshot);
+                    let cursor_point = buffer_snapshot.offset_to_point(cursor_offset);
+
+                    let snapshot_differ = SnapshotDiffer::new();
+                    let diff_result = snapshot_differ.extract_inline_edits(
+                        &buffer_snapshot,
+                        cursor_offset,
+                        cursor_point,
+                        &next_edit.text,
+                        Some(next_edit.range),
+                    );
+
+                    let precomputed_edits = if diff_result.edits.is_empty() {
+                        None
+                    } else {
+                        Some(diff_result.edits)
+                    };
+
+                    // Store the followup as current completion
+                    self.current_completion = Some(CompletionState {
+                        text: next_edit.text,
+                        binding_id: next_edit.binding_id,
+                        range_start: cursor_position,
+                        range_end: cursor_position,
+                        api_range: Some(next_edit.range),
+                        should_retrigger: !session.queue.is_empty(), // Retrigger if more followups
+                        precomputed_edits,
+                        original_snapshot: Some(buffer_snapshot),
+                        cursor_prediction: None, // Followups don't have cursor prediction
+                        is_fused_model: self.is_fused_cursor_prediction_model,
+                        is_multidiff_model: self.is_multidiff_model,
+                        jump_target: None, // Followups are always in the same file
+                    });
+
+                    // Clear session if no more followups
+                    if session.queue.is_empty() {
+                        self.followup_session = None;
+                    }
+
+                    cx.notify();
+                    return;
+                }
+            }
         }
 
         // Ensure we have a stable workspace_id based on project path
@@ -1235,8 +1591,39 @@ impl EditPredictionProvider for CtabCompletionProvider {
         self.file_extension = file_path.rsplit('.').next().map(|s| s.to_string());
         self.current_file_path = Some(file_path.clone());
 
-        // Collect additional files and context items for multi-file context
-        let (additional_files, mut context_items) = self.collect_additional_files(&file_path, cx);
+        // Record file edit in smart context tracker
+        self.smart_context.record_file_edit(&file_path);
+
+        // Collect smart context using the enhanced engine
+        let language_id = Self::detect_language(&file_path);
+        let smart_items =
+            self.smart_context
+                .collect_context(&buffer, offset, &file_path, &language_id, cx);
+
+        // Convert to proto formats
+        let additional_files = SmartContextEngine::to_additional_files(&smart_items);
+        let mut context_items = SmartContextEngine::to_context_items(&smart_items);
+        // Convert smart context items to CodeResult format for enhanced context
+        let code_results = SmartContextEngine::to_code_results(&smart_items);
+        // Convert LSP resolver cache to LspSubgraphFullContext format
+        let lsp_contexts = self.smart_context.to_lsp_contexts();
+
+        log::info!(
+            "Ctab: SmartContext collected {} items (sources: {})",
+            smart_items.len(),
+            smart_items
+                .iter()
+                .map(|s| format!("{:?}", s.source))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        // Log new high-priority fields status
+        log::info!(
+            "Ctab: Enhanced fields - code_results={}, parameter_hints=0 (todo), lsp_contexts={}",
+            code_results.len(),
+            lsp_contexts.len()
+        );
 
         // Add enclosing scope context (TreeSitter based, synchronous)
         if let Some(enclosing_context) = self.get_enclosing_context(&snapshot, offset, &file_path) {
@@ -1343,6 +1730,18 @@ impl EditPredictionProvider for CtabCompletionProvider {
             filesync_updates.len()
         );
 
+        // Log file sync capability analysis to file
+        {
+            use crate::file_sync::get_filesync_logger;
+            let logger = get_filesync_logger();
+            logger.log_capability_analysis(
+                &file_path,
+                rely_on_filesync,
+                filesync_updates.len(),
+                content.len(),
+            );
+        }
+
         // Phase 1: Collect diagnostics from buffer
         // Only collect Error and Warning severity, limit to 20 entries to save tokens
         let diagnostics: Vec<ProtoDiagnostic> = snapshot
@@ -1387,6 +1786,29 @@ impl EditPredictionProvider for CtabCompletionProvider {
                 diagnostics.len(),
                 file_path
             );
+            // Log each diagnostic detail for debugging
+            for (i, diag) in diagnostics.iter().enumerate() {
+                if let Some(ref range) = diag.range {
+                    let start = range
+                        .start_position
+                        .as_ref()
+                        .map(|p| format!("{}:{}", p.line, p.column))
+                        .unwrap_or_default();
+                    let end = range
+                        .end_position
+                        .as_ref()
+                        .map(|p| format!("{}:{}", p.line, p.column))
+                        .unwrap_or_default();
+                    log::info!(
+                        "Cometix: Diagnostic[{}]: severity={:?}, range={}..{}, message='{}'",
+                        i,
+                        diag.severity,
+                        start,
+                        end,
+                        diag.message
+                    );
+                }
+            }
         }
 
         // Build the request
@@ -1413,9 +1835,21 @@ impl EditPredictionProvider for CtabCompletionProvider {
                 contents: content.clone(),
                 rely_on_filesync,
                 sha_256_hash: Some(content_hash),
+                // Cursor API uses 1-indexed line/column numbers
                 cursor_position: Some(CursorPosition {
-                    line: point.row as i32,
-                    column: point.column as i32,
+                    line: (point.row + 1) as i32,
+                    column: (point.column + 1) as i32,
+                }),
+                // Selection: use cursor position as both start and end (no selection = cursor at point)
+                selection: Some(CursorRange {
+                    start_position: Some(CursorPosition {
+                        line: (point.row + 1) as i32,
+                        column: (point.column + 1) as i32,
+                    }),
+                    end_position: Some(CursorPosition {
+                        line: (point.row + 1) as i32,
+                        column: (point.column + 1) as i32,
+                    }),
                 }),
                 total_number_of_lines: content.lines().count() as i32,
                 language_id: Self::detect_language(&file_path),
@@ -1428,6 +1862,10 @@ impl EditPredictionProvider for CtabCompletionProvider {
             // Note: diff_history field is deprecated, use file_diff_histories instead
             diff_history: vec![],
             model_name: Some(model_name),
+            // New fields from unite.proto
+            linter_errors: None, // TODO: Convert diagnostics to LinterErrors format
+            diff_history_keys: vec![],
+            give_debug_output: None,
             // Build proper CppFileDiffHistory structure with complete history
             file_diff_histories: if diff_history.is_empty() {
                 vec![]
@@ -1444,6 +1882,10 @@ impl EditPredictionProvider for CtabCompletionProvider {
                     diff_history_timestamps: diff_timestamps,
                 }]
             },
+            merged_diff_histories: vec![],
+            block_diff_patches: vec![],
+            is_nightly: Some(false),
+            is_debug: None,
             immediately_ack: Some(false),
             enable_more_context: Some(true),
             cpp_intent_info: Some(CppIntentInfo {
@@ -1463,8 +1905,18 @@ impl EditPredictionProvider for CtabCompletionProvider {
             time_since_request_start: 0.0,
             time_at_request_send: 0.0,
             client_timezone_offset: None,
+            // LSP suggested items (autocomplete suggestions)
+            lsp_suggested_items: None, // TODO: Integrate with LSP completion provider
             supports_cpt: Some(true),
             supports_crlf_cpt: Some(false),
+            // High priority enhancements (Phase 2)
+            // Parameter hints: would require LSP signature help integration
+            // For now, leave empty as placeholder for future LSP integration
+            parameter_hints: vec![],
+            // LSP symbol contexts: converted from LspResolver cache
+            lsp_contexts,
+            // Code results from search/context - populated from smart_context
+            code_results,
         };
 
         let http_client = self.http_client.clone();
@@ -1474,12 +1926,16 @@ impl EditPredictionProvider for CtabCompletionProvider {
         // Capture buffer for diff calculation in the async callback
         let buffer_for_diff = buffer.clone();
 
+        // Capture file path for followup session
+        let current_file_path = file_path.clone();
+
         self.pending_refresh = Some(cx.spawn(async move |this, cx| {
             if debounce {
                 gpui::Timer::after(Duration::from_millis(debounce_ms)).await;
             }
 
-            let response = Self::fetch_completion(
+            // Use multidiff-aware fetch
+            let response = Self::fetch_completion_multidiff(
                 http_client,
                 request,
                 auth_token,
@@ -1497,128 +1953,141 @@ impl EditPredictionProvider for CtabCompletionProvider {
                 this.pending_refresh = None;
 
                 match response {
-                    Ok(response) => {
-                        if !response.text.is_empty() {
-                            // DEBUG: Log raw API response with escape sequences visible
-                            log::info!(
-                                "Cometix: [DEBUG] Raw API completion (len={}): {:?}",
-                                response.text.len(),
-                                response.text
-                            );
-                            log::info!(
-                                "Cometix: [DEBUG] range_to_replace={:?}, should_remove_leading_eol={:?}",
-                                response.range_to_replace,
-                                response.should_remove_leading_eol
-                            );
+                    Ok(parse_result) => {
+                        // Update model info
+                        this.is_fused_cursor_prediction_model = parse_result.is_fused_model;
+                        this.is_multidiff_model = parse_result.is_multidiff_model;
 
-                            // Determine range based on API response
-                            let (range_start, range_end, api_range) = if let Some(ref range) =
-                                response.range_to_replace
-                            {
-                                // Convert 1-based line numbers to 0-based
-                                let start_line = (range.start_line_number.max(1) - 1) as u32;
-                                let end_line = (range.end_line_number_inclusive.max(1) - 1) as u32;
-
-                                log::debug!(
-                                    "Cometix: Range replacement: lines {}-{} (0-based: {}-{})",
-                                    range.start_line_number,
-                                    range.end_line_number_inclusive,
-                                    start_line,
-                                    end_line
-                                );
-
-                                // Create anchors for the range
-                                // Note: This requires buffer access which we don't have here
-                                // For now, fall back to cursor position
-                                // TODO: Properly convert line range to anchors
-                                (
-                                    cursor_position,
-                                    cursor_position,
-                                    Some((
-                                        range.start_line_number,
-                                        range.end_line_number_inclusive,
-                                    )),
-                                )
-                            } else {
-                                (cursor_position, cursor_position, None)
-                            };
-
-                            // Log cursor prediction if available
-                            if let Some(ref prediction) = response.cursor_prediction_target {
-                                log::debug!(
-                                    "Cometix: Cursor prediction: line {} (0-based: {})",
-                                    prediction.line_number_one_indexed,
-                                    prediction.line_number_one_indexed - 1
-                                );
-                            }
-
-                            // Process completion text - handle leading EOL removal
-                            let mut completion_text = response.text;
-                            if response.should_remove_leading_eol.unwrap_or(false) {
-                                log::debug!(
-                                    "Cometix: Removing leading EOL from completion (should_remove_leading_eol=true)"
-                                );
-                                completion_text = completion_text
-                                    .strip_prefix('\n')
-                                    .or_else(|| completion_text.strip_prefix("\r\n"))
-                                    .map(|s| s.to_string())
-                                    .unwrap_or(completion_text);
-                            }
-
-                            // Determine if we should retrigger completion after this one
-                            let should_retrigger = response
-                                .cursor_prediction_target
-                                .as_ref()
-                                .map(|t| t.should_retrigger_cpp)
-                                .unwrap_or(true); // Default to true to maintain existing behavior
-
-                            // Pre-compute edits using SnapshotDiffer (avoid heavy work in suggest())
-                            // This is the KEY FIX for the hang issue: diff computation happens here
-                            // in the async context, not in the UI thread during suggest()
-                            let buffer_ref = buffer_for_diff.read(cx);
-                            let buffer_snapshot = buffer_ref.snapshot();
-                            let cursor_offset = cursor_position.to_offset(&buffer_snapshot);
-                            let cursor_point = buffer_snapshot.offset_to_point(cursor_offset);
-
-                            let snapshot_differ = SnapshotDiffer::new();
-                            let diff_result = snapshot_differ.extract_inline_edits(
-                                &buffer_snapshot,
-                                cursor_offset,
-                                cursor_point,
-                                &completion_text,
-                                api_range,
-                            );
-
-                            log::info!(
-                                "Cometix: Pre-computed {} edits, confidence={:.3}, optimizations={:?}",
-                                diff_result.edits.len(),
-                                diff_result.confidence,
-                                diff_result.optimizations
-                            );
-
-                            let precomputed_edits = if diff_result.edits.is_empty() {
-                                None
-                            } else {
-                                Some(diff_result.edits)
-                            };
-
-                            // Store the completion with pre-computed edits and snapshot for interpolation
-                            this.current_completion = Some(CompletionState {
-                                text: completion_text,
-                                binding_id: response.binding_id,
-                                range_start,
-                                range_end,
-                                api_range,
-                                should_retrigger,
-                                precomputed_edits,
-                                original_snapshot: Some(buffer_snapshot),
-                            });
-
-                            cx.notify();
+                        if parse_result.edits.is_empty() {
+                            log::debug!("Ctab: [Multidiff] No edits received");
+                            return;
                         }
+
+                        log::info!(
+                            "Ctab: [Multidiff] Received {} edits, cursor_prediction={:?}",
+                            parse_result.edits.len(),
+                            parse_result.cursor_prediction.as_ref().map(|p| &p.relative_path)
+                        );
+
+                        // Take first edit for immediate display
+                        let first_edit = &parse_result.edits[0];
+                        let api_range = Some(first_edit.range);
+
+                        log::info!(
+                            "Ctab: [Multidiff] First edit: lines {}-{}, text_len={}",
+                            first_edit.range.0,
+                            first_edit.range.1,
+                            first_edit.text.len()
+                        );
+
+                        // Store remaining edits in followup queue
+                        if parse_result.edits.len() > 1 {
+                            let followup_edits: Vec<EditPart> =
+                                parse_result.edits[1..].to_vec();
+                            log::info!(
+                                "Ctab: [Multidiff] Queueing {} followup edits",
+                                followup_edits.len()
+                            );
+
+                            let buffer_ref = buffer_for_diff.read(cx);
+                            this.followup_session = Some(FollowupSession {
+                                document_path: current_file_path.clone(),
+                                queue: followup_edits,
+                                buffer_version: buffer_ref.version(),
+                            });
+                        } else {
+                            this.followup_session = None;
+                        }
+
+                        // Pre-compute edits using SnapshotDiffer
+                        let buffer_ref = buffer_for_diff.read(cx);
+                        let buffer_snapshot = buffer_ref.snapshot();
+                        let cursor_offset = cursor_position.to_offset(&buffer_snapshot);
+                        let cursor_point = buffer_snapshot.offset_to_point(cursor_offset);
+
+                        let snapshot_differ = SnapshotDiffer::new();
+                        let diff_result = snapshot_differ.extract_inline_edits(
+                            &buffer_snapshot,
+                            cursor_offset,
+                            cursor_point,
+                            &first_edit.text,
+                            api_range,
+                        );
+
+                        log::info!(
+                            "Ctab: Pre-computed {} edits, confidence={:.3}, optimizations={:?}",
+                            diff_result.edits.len(),
+                            diff_result.confidence,
+                            diff_result.optimizations
+                        );
+
+                        let precomputed_edits = if diff_result.edits.is_empty() {
+                            None
+                        } else {
+                            Some(diff_result.edits)
+                        };
+
+                        // Determine if we should retrigger
+                        let should_retrigger = parse_result
+                            .cursor_prediction
+                            .as_ref()
+                            .map(|p| p.should_retrigger_cpp)
+                            .unwrap_or(this.followup_session.is_some()); // Retrigger if there are followups
+
+                        // Check for cross-file cursor prediction and try to preload target buffer
+                        let jump_target = if let Some(ref prediction) = parse_result.cursor_prediction {
+                            // Check if prediction is for a different file
+                            let is_cross_file = prediction.relative_path != current_file_path;
+                            if is_cross_file {
+                                log::info!(
+                                    "Ctab: [CursorPrediction] Cross-file jump detected: {} -> {}:{}",
+                                    current_file_path,
+                                    prediction.relative_path,
+                                    prediction.line_number_one_indexed
+                                );
+                                // Try to find and open the target buffer
+                                if let Some(ref project) = this.project {
+                                    Self::try_preload_jump_target(
+                                        project,
+                                        &prediction.relative_path,
+                                        prediction.line_number_one_indexed,
+                                        cx,
+                                    )
+                                } else {
+                                    log::debug!("Ctab: [CursorPrediction] No project available for preloading");
+                                    None
+                                }
+                            } else {
+                                log::info!(
+                                    "Ctab: [CursorPrediction] Same-file prediction: line {}",
+                                    prediction.line_number_one_indexed
+                                );
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        // Store the completion
+                        this.current_completion = Some(CompletionState {
+                            text: first_edit.text.clone(),
+                            binding_id: first_edit.binding_id.clone(),
+                            range_start: cursor_position,
+                            range_end: cursor_position,
+                            api_range,
+                            should_retrigger,
+                            precomputed_edits,
+                            original_snapshot: Some(buffer_snapshot),
+                            cursor_prediction: parse_result.cursor_prediction,
+                            is_fused_model: parse_result.is_fused_model,
+                            is_multidiff_model: parse_result.is_multidiff_model,
+                            jump_target,
+                        });
+
+                        cx.notify();
                     }
                     Err(e) => {
-                        log::error!("Cometix: Failed to fetch completion: {}", e);
+                        log::error!("Ctab: [Multidiff] Failed to fetch completion: {}", e);
                     }
                 }
             })?;
@@ -1639,15 +2108,9 @@ impl EditPredictionProvider for CtabCompletionProvider {
 
     fn accept(&mut self, cx: &mut Context<Self>) {
         if let Some(completion) = self.current_completion.take() {
-            // Check if we should skip the next refresh (prevents completion loop)
-            if !completion.should_retrigger {
-                log::debug!("Cometix: Disabling next refresh (should_retrigger=false)");
-                self.skip_next_refresh = true;
-            }
-
             // Send fate recording
-            if let Some(binding_id) = completion.binding_id {
-                self.send_fate(binding_id, CppFate::Accept, cx);
+            if let Some(ref binding_id) = completion.binding_id {
+                self.send_fate(binding_id.clone(), CppFate::Accept, cx);
             }
 
             // Trigger CppAppend to sync the accepted completion with the server
@@ -1658,6 +2121,28 @@ impl EditPredictionProvider for CtabCompletionProvider {
                     .unwrap_or_else(|| "untitled".to_string());
                 let changes = self.build_append_changes(&completion.text, &file_path);
                 self.trigger_append(changes, cx);
+            }
+
+            // Check for followup edits (multidiff support)
+            if let Some(ref mut session) = self.followup_session {
+                if !session.queue.is_empty() {
+                    log::info!(
+                        "Ctab: [Multidiff] {} followup edits remaining after accept",
+                        session.queue.len()
+                    );
+                    // Don't skip next refresh - we want to show the next edit
+                    // The next refresh will pick up from the followup queue
+                    return;
+                }
+            }
+
+            // Clear followup session if empty
+            self.followup_session = None;
+
+            // Check if we should skip the next refresh (prevents completion loop)
+            if !completion.should_retrigger {
+                log::debug!("Ctab: Disabling next refresh (should_retrigger=false)");
+                self.skip_next_refresh = true;
             }
         }
     }
@@ -1681,6 +2166,26 @@ impl EditPredictionProvider for CtabCompletionProvider {
         // Verify buffer matches
         if self.buffer_id != Some(buffer.entity_id()) {
             return None;
+        }
+
+        // PRIORITY: Check for cross-file jump target first
+        // If we have a preloaded jump target, return Jump prediction
+        if let Some((ref target_snapshot, ref target_anchor)) = completion.jump_target {
+            log::info!(
+                "Ctab: [CursorPrediction] Returning Jump prediction to {:?}",
+                completion
+                    .cursor_prediction
+                    .as_ref()
+                    .map(|p| &p.relative_path)
+            );
+            return Some(EditPrediction::Jump {
+                id: completion
+                    .binding_id
+                    .as_ref()
+                    .map(|id| SharedString::from(id.clone())),
+                snapshot: target_snapshot.clone(),
+                target: *target_anchor,
+            });
         }
 
         // Get pre-computed edits and original snapshot for interpolation

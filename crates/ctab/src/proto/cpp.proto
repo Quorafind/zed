@@ -2,7 +2,7 @@ syntax = "proto3";
 package aiserver.v1;
 
 // Core message types for Cometix completion API
-// Simplified version for Zed integration
+// Enhanced version for Zed integration with high-priority fields
 
 // Position types
 message CursorPosition {
@@ -53,16 +53,18 @@ message Diagnostic {
 message CurrentFileInfo {
     string relative_workspace_path = 1;
     string contents = 2;
-    bool rely_on_filesync = 18;
-    optional string sha_256_hash = 17;
     CursorPosition cursor_position = 3;
-    int32 total_number_of_lines = 8;
     string language_id = 5;
+    // User selection range (high priority enhancement)
+    CursorRange selection = 6;
+    // Diagnostic information (errors/warnings)
+    repeated Diagnostic diagnostics = 7;
+    int32 total_number_of_lines = 8;
     optional int32 file_version = 14;
+    optional string sha_256_hash = 17;
+    bool rely_on_filesync = 18;
     string workspace_root_path = 19;
     optional string line_ending = 20;
-    // Diagnostic information (errors/warnings) - Phase 1 enhancement
-    repeated Diagnostic diagnostics = 7;
 }
 
 // Diff history
@@ -95,6 +97,180 @@ message CppContextItem {
     float score = 4;
 }
 
+// ============================================================================
+// Linter Error Types (from unite.proto)
+// ============================================================================
+
+// Single linter error
+message LinterError {
+    string message = 1;
+    CursorRange range = 2;
+    optional string source = 3;
+    repeated Diagnostic.RelatedInformation related_information = 4;
+    optional Diagnostic.DiagnosticSeverity severity = 5;
+}
+
+// Collection of linter errors for a file
+message LinterErrors {
+    string relative_workspace_path = 1;
+    repeated LinterError errors = 2;
+    string file_contents = 3;
+}
+
+// ============================================================================
+// LSP Suggestion Types (from unite.proto)
+// ============================================================================
+
+// Single LSP suggestion (autocomplete item)
+message LspSuggestion {
+    string label = 1;
+}
+
+// Collection of LSP suggestions
+message LspSuggestedItems {
+    repeated LspSuggestion suggestions = 1;
+}
+
+// ============================================================================
+// Repository Info (from unite.proto)
+// ============================================================================
+
+// Embedding model enum
+enum EmbeddingModel {
+    EMBEDDING_MODEL_UNSPECIFIED = 0;
+    EMBEDDING_MODEL_VOYAGE_CODE_2 = 1;
+    EMBEDDING_MODEL_TEXT_EMBEDDINGS_LARGE_3 = 2;
+    EMBEDDING_MODEL_QWEN_1_5B_CUSTOM = 3;
+    EMBEDDING_MODEL_MOCK_CHUNKER_ERROR = 4;
+    EMBEDDING_MODEL_QWEN_1_5B_0618_CUSTOM = 5;
+    EMBEDDING_MODEL_QWEN_1_5B_0618_FP8_MM_CUSTOM = 6;
+}
+
+// Database provider enum
+enum DatabaseProvider {
+    DATABASE_PROVIDER_UNSPECIFIED = 0;
+    DATABASE_PROVIDER_AURORA = 1;
+    DATABASE_PROVIDER_PLANETSCALE = 2;
+}
+
+// Repository information
+message RepositoryInfo {
+    string relative_workspace_path = 1;
+    repeated string remote_urls = 2;
+    repeated string remote_names = 3;
+    string repo_name = 4;
+    string repo_owner = 5;
+    bool is_tracked = 6;
+    bool is_local = 7;
+    optional int32 num_files = 8;
+    optional double orthogonal_transform_seed = 9;
+    optional EmbeddingModel preferred_embedding_model = 10;
+    string workspace_uri = 11;
+    optional DatabaseProvider preferred_db_provider = 12;
+}
+
+// ============================================================================
+// Block Diff Patch (from unite.proto)
+// ============================================================================
+
+// I-Range for block diff operations
+message IRange {
+    int32 start_line_number = 1;
+    int32 start_column = 2;
+    int32 end_line_number = 3;
+    int32 end_column = 4;
+}
+
+// Block diff patch for incremental changes
+message BlockDiffPatch {
+    message Change {
+        string text = 1;
+        IRange range = 2;
+    }
+    message ModelWindow {
+        repeated string lines = 1;
+        int32 start_line_number = 2;
+        int32 end_line_number = 3;
+    }
+    ModelWindow start_model_window = 1;
+    repeated Change changes = 3;
+    string relative_path = 4;
+    string model_uuid = 7;
+    int32 start_from_change_index = 5;
+}
+
+// ============================================================================
+// CPP Source Enum (from unite.proto)
+// ============================================================================
+
+// Source of CPP trigger
+enum CppSource {
+    CPP_SOURCE_UNSPECIFIED = 0;
+    CPP_SOURCE_LINE_CHANGE = 1;
+    CPP_SOURCE_TYPING = 2;
+    CPP_SOURCE_OPTION_HOLD = 3;
+    CPP_SOURCE_LINTER_ERRORS = 4;
+    CPP_SOURCE_PARAMETER_HINTS = 5;
+    CPP_SOURCE_CURSOR_PREDICTION = 6;
+    CPP_SOURCE_MANUAL_TRIGGER = 7;
+    CPP_SOURCE_EDITOR_CHANGE = 8;
+    CPP_SOURCE_LSP_SUGGESTIONS = 9;
+}
+
+// Parameter hint for function calls (high priority enhancement)
+message CppParameterHint {
+    string label = 1;
+    optional string documentation = 2;
+}
+
+// LSP Subgraph types for symbol context (high priority enhancement)
+message LspSubgraphPosition {
+    int32 line = 1;
+    int32 character = 2;
+}
+
+message LspSubgraphRange {
+    int32 start_line = 1;
+    int32 start_character = 2;
+    int32 end_line = 3;
+    int32 end_character = 4;
+}
+
+message LspSubgraphContextItem {
+    optional string uri = 1;
+    string type = 2;
+    string content = 3;
+    optional LspSubgraphRange range = 4;
+}
+
+message LspSubgraphFullContext {
+    string uri = 1;
+    string symbol_name = 2;
+    repeated LspSubgraphPosition positions = 3;
+    repeated LspSubgraphContextItem context_items = 4;
+    float score = 5;
+}
+
+// Code block for code results (high priority enhancement)
+message CodeBlock {
+    message Signatures {
+        repeated CursorRange ranges = 1;
+    }
+    string relative_workspace_path = 1;
+    optional string file_contents = 2;
+    CursorRange range = 3;
+    string contents = 4;
+    Signatures signatures = 5;
+    optional string override_contents = 6;
+    optional string original_contents = 7;
+}
+
+// Code result from search/context (high priority enhancement)
+message CodeResult {
+    CodeBlock code_block = 1;
+    float score = 2;
+}
+
 // Filesync update
 message FilesyncUpdateWithModelVersion {
     int32 model_version = 1;
@@ -123,11 +299,29 @@ message StreamCppRequest {
     CurrentFileInfo current_file = 1;
     repeated string diff_history = 2;
     optional string model_name = 3;
+    // Linter errors for current file (from unite.proto)
+    optional LinterErrors linter_errors = 4;
+    // Diff history keys for caching
+    repeated string diff_history_keys = 5;
+    // Request debug output from model
+    optional bool give_debug_output = 6;
     repeated CppFileDiffHistory file_diff_histories = 7;
+    // Merged diff histories (from unite.proto)
+    repeated CppFileDiffHistory merged_diff_histories = 8;
+    // Block diff patches for incremental updates (from unite.proto)
+    repeated BlockDiffPatch block_diff_patches = 9;
+    // Whether running nightly build
+    optional bool is_nightly = 10;
+    // Whether in debug mode
+    optional bool is_debug = 11;
     optional bool immediately_ack = 12;
     repeated CppContextItem context_items = 13;
-    optional bool enable_more_context = 17;
+    // Parameter hints for function calls (high priority enhancement)
+    repeated CppParameterHint parameter_hints = 14;
+    // LSP symbol contexts (high priority enhancement)
+    repeated LspSubgraphFullContext lsp_contexts = 15;
     optional CppIntentInfo cpp_intent_info = 16;
+    optional bool enable_more_context = 17;
     optional string workspace_id = 18;
     repeated AdditionalFile additional_files = 19;
     optional ControlToken control_token = 20;
@@ -136,8 +330,12 @@ message StreamCppRequest {
     double time_since_request_start = 23;
     double time_at_request_send = 24;
     optional double client_timezone_offset = 25;
+    // LSP suggested items (autocomplete suggestions, from unite.proto)
+    optional LspSuggestedItems lsp_suggested_items = 26;
     optional bool supports_cpt = 27;
     optional bool supports_crlf_cpt = 28;
+    // Code search results (high priority enhancement)
+    repeated CodeResult code_results = 29;
 }
 
 // Main response message
@@ -159,6 +357,12 @@ message StreamCppResponse {
     optional int32 suggestion_confidence = 3;
     optional bool done_stream = 4;
     optional string debug_model_output = 5;
+    // Debug fields (from unite.proto)
+    optional string debug_model_input = 6;
+    optional string debug_stream_time = 7;
+    optional string debug_total_time = 8;
+    optional string debug_ttft_time = 9;
+    optional string debug_server_timing = 10;
     optional LineRange range_to_replace = 11;
     optional CursorPredictionTarget cursor_prediction_target = 12;
     optional bool done_edit = 13;
@@ -194,41 +398,120 @@ message CppConfigRequest {
 }
 
 message CppConfigResponse {
+    // Heuristic enum for filtering suggestions
+    enum Heuristic {
+        HEURISTIC_UNSPECIFIED = 0;
+        HEURISTIC_LOTS_OF_ADDED_TEXT = 1;
+        HEURISTIC_DUPLICATING_LINE_AFTER_SUGGESTION = 2;
+        HEURISTIC_DUPLICATING_MULTIPLE_LINES_AFTER_SUGGESTION = 3;
+        HEURISTIC_REVERTING_USER_CHANGE = 4;
+        HEURISTIC_OUTPUT_EXTENDS_BEYOND_RANGE_AND_IS_REPEATED = 5;
+        HEURISTIC_SUGGESTING_RECENTLY_REJECTED_EDIT = 6;
+    }
+
+    // Import prediction configuration
+    message ImportPredictionConfig {
+        bool is_disabled_by_backend = 1;
+        bool should_turn_on_automatically = 2;
+        bool python_enabled = 3;
+    }
+
+    // Merge behavior configuration
+    message MergeBehavior {
+        string type = 1;
+        optional int32 limit = 2;
+        optional int32 radius = 3;
+    }
+
+    // Recently rejected edit thresholds
+    message RecentlyRejectedEditThresholds {
+        int32 hard_reject_threshold = 1;
+        int32 soft_reject_threshold = 2;
+    }
+
+    // Suggestion hint configuration
+    message SuggestionHintConfig {
+        repeated string important_lsp_extensions = 1;
+        repeated string enabled_for_path_extensions = 2;
+    }
+
     optional int32 above_radius = 1;
     optional int32 below_radius = 2;
+    // Merge behavior (from unite.proto)
+    optional MergeBehavior merge_behavior = 4;
     optional bool is_on = 5;
     optional bool is_ghost_text = 6;
+    // Allow user to enable CPP even if not pro (from unite.proto)
+    optional bool should_let_user_enable_cpp_even_if_not_pro = 7;
+    // Heuristics for filtering suggestions (from unite.proto)
+    repeated Heuristic heuristics = 8;
+    // Patterns to exclude from recently viewed files (from unite.proto)
+    repeated string exclude_recently_viewed_files_patterns = 9;
+    // Enable recently viewed file tracking (from unite.proto)
+    bool enable_rvf_tracking = 10;
     int32 global_debounce_duration_millis = 11;
     int32 client_debounce_duration_millis = 12;
     string cpp_url = 13;
+    // Use whitespace diff history (from unite.proto)
+    bool use_whitespace_diff_history = 14;
+    // Import prediction config (from unite.proto)
+    ImportPredictionConfig import_prediction_config = 15;
+    // Enable filesync debounce skipping (from unite.proto)
+    bool enable_filesync_debounce_skipping = 16;
+    // Filesync hash check percentage (from unite.proto)
+    float check_filesync_hash_percent = 17;
     string geo_cpp_backend_url = 18;
+    // Recently rejected edit thresholds (from unite.proto)
+    optional RecentlyRejectedEditThresholds recently_rejected_edit_thresholds = 19;
     bool is_fused_cursor_prediction_model = 20;
+    // Include unchanged lines in context (from unite.proto)
+    bool include_unchanged_lines = 21;
+    // Fetch recently viewed file text (from unite.proto)
+    bool should_fetch_rvf_text = 22;
+    // Max cleared suggestions since last accept (from unite.proto)
+    optional int32 max_number_of_cleared_suggestions_since_last_accept = 23;
+    // Suggestion hint config (from unite.proto)
+    optional SuggestionHintConfig suggestion_hint_config = 24;
     // Phase 3: Enhanced config fields
-    optional bool allows_tab_chunks = 21;
-    optional int32 tab_context_refresh_debounce_ms = 22;
-    optional int32 tab_context_refresh_editor_change_debounce_ms = 23;
+    bool allows_tab_chunks = 25;
+    optional int32 tab_context_refresh_debounce_ms = 26;
+    optional int32 tab_context_refresh_editor_change_debounce_ms = 27;
 }
 
 // Phase 2: Tab Context Refresh API (for RAG-based context retrieval)
 // Triggered on file switch or user idle
+// Extended to match unite.proto
 message RefreshTabContextRequest {
     // Current file context
     CurrentFileInfo current_file = 1;
-    // Project identifier
-    string workspace_id = 2;
     // Model name (e.g., "claude-3-5-sonnet", "cursor-small")
-    optional string model_name = 3;
-    // Whether to include diff history
-    optional bool include_diff_history = 4;
+    optional string model_name = 2;
+    // Linter errors for context
+    optional LinterErrors linter_errors = 3;
+    // File diff histories
+    repeated CppFileDiffHistory file_diff_histories = 4;
+    // Additional open files
+    repeated AdditionalFile additional_files = 5;
+    // Client timestamp
+    optional double client_time = 6;
+    // Time since request started
+    double time_since_request_start = 7;
+    // Time when request was sent
+    double time_at_request_send = 8;
+    // Debug mode
+    optional bool is_debug = 9;
+    // Project identifier
+    optional string workspace_id = 10;
+    // Cursor prediction support
+    optional bool supports_cpt = 11;
+    optional bool supports_crlf_cpt = 12;
+    // Repository information
+    RepositoryInfo repository_info = 13;
 }
 
 message RefreshTabContextResponse {
-    // Server-retrieved high-relevance code snippets
-    repeated CppContextItem context_items = 1;
-    // Whether the request was successful
-    optional bool success = 2;
-    // Suggested cache TTL (in milliseconds)
-    optional int32 cache_ttl_ms = 3;
+    // Server-retrieved high-relevance code results (matches unite.proto)
+    repeated CodeResult code_results = 1;
 }
 
 // Append completion request/response

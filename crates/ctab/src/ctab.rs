@@ -7,6 +7,7 @@ mod completion_differ;
 mod completion_provider;
 mod diff_tracker;
 mod file_sync;
+mod smart_context;
 mod snapshot_differ;
 
 pub mod proto {

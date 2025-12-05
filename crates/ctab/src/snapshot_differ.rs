@@ -239,10 +239,11 @@ impl SnapshotDiffer {
             );
 
             // Validate line numbers
+            // Allow start_line to point one past the last line (append mode)
             let max_line = snapshot.max_point().row;
-            if start_line_0 > max_line {
+            if start_line_0 > max_line + 1 {
                 log::warn!(
-                    "SnapshotDiffer: start_line {} exceeds max_line {}",
+                    "SnapshotDiffer: start_line {} exceeds max_line + 1 ({})",
                     start_line_0,
                     max_line
                 );
@@ -257,11 +258,24 @@ impl SnapshotDiffer {
 
             // Calculate the range to replace - FROM LINE START to LINE END
             // This is a FULL LINE replacement, replacing everything including what user typed
-            let replace_start = snapshot.point_to_offset(Point::new(start_line_0, 0));
-            let replace_end = snapshot.point_to_offset(Point::new(
+            // If start_line exceeds existing lines, use EOF as the start offset (append mode)
+            let replace_start = if start_line_0 > max_line {
+                snapshot.len()
+            } else {
+                snapshot.point_to_offset(Point::new(start_line_0, 0))
+            };
+
+            let mut replace_end = snapshot.point_to_offset(Point::new(
                 end_line_clamped,
                 snapshot.line_len(end_line_clamped),
             ));
+
+            // Handle append scenario where start > end (API returns start > end for insertion)
+            // In this case, replace_start (EOF) may be greater than replace_end (last line end)
+            // Correct it to create an insertion point at EOF
+            if replace_start > replace_end {
+                replace_end = replace_start;
+            }
 
             log::debug!(
                 "SnapshotDiffer: Replacing FULL line range {}..{} (lines {} to {})",
