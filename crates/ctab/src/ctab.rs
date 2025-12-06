@@ -7,6 +7,7 @@ mod completion_provider;
 mod diagnostics_tracker;
 mod diff_tracker;
 mod file_sync;
+mod request_logger;
 mod request_manager;
 mod smart_context;
 mod snapshot_differ;
@@ -43,6 +44,9 @@ pub enum EndpointType {
     Selfhosted,
 }
 
+/// Default idle trigger delay in milliseconds
+pub const DEFAULT_IDLE_TRIGGER_MS: u64 = 1500;
+
 /// Settings for Ctab
 #[derive(Clone, Debug, Default, RegisterSetting)]
 pub struct CtabSettings {
@@ -62,6 +66,8 @@ pub struct CtabSettings {
     pub debounce_ms: u64,
     /// Maximum completion length
     pub max_completion_length: u32,
+    /// Idle trigger delay in milliseconds (0 to disable)
+    pub idle_trigger_ms: u64,
 }
 
 impl CtabSettings {
@@ -161,6 +167,9 @@ impl Settings for CtabSettings {
             model: ctab.and_then(|c| c.model.clone()),
             debounce_ms: ctab.and_then(|c| c.debounce_ms).unwrap_or(75),
             max_completion_length: ctab.and_then(|c| c.max_completion_length).unwrap_or(2000),
+            idle_trigger_ms: ctab
+                .and_then(|c| c.idle_trigger_ms)
+                .unwrap_or(DEFAULT_IDLE_TRIGGER_MS),
         }
     }
 }

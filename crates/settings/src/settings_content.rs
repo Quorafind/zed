@@ -200,6 +200,13 @@ pub struct CtabSettingsContent {
     ///
     /// Default: 2000
     pub max_completion_length: Option<u32>,
+    /// Idle trigger delay in milliseconds.
+    /// When the cursor stays in the same position for this duration,
+    /// a completion request will be triggered automatically.
+    /// Set to 0 to disable idle triggering.
+    ///
+    /// Default: 1500
+    pub idle_trigger_ms: Option<u64>,
 }
 
 /// The type of endpoint to use for Ctab API calls.

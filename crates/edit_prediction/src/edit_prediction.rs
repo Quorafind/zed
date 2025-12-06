@@ -21,6 +21,9 @@ pub enum EditPrediction {
         id: Option<SharedString>,
         edits: Vec<(Range<language::Anchor>, Arc<str>)>,
         edit_preview: Option<language::EditPreview>,
+        /// Whether to autoscroll to the edit location after accepting.
+        /// Set to true for multidiff followup edits so users can see the next edit.
+        autoscroll: bool,
     },
     /// Jump to a different file from the one that requested the prediction
     Jump {

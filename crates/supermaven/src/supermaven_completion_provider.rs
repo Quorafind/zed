@@ -101,6 +101,7 @@ fn completion_from_diff(
         id: None,
         edits,
         edit_preview: None,
+        autoscroll: false,
     }
 }
 

@@ -2,6 +2,7 @@
 //!
 //! Implements the EditPredictionProvider trait for Cursor AI completions.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use edit_prediction::{Direction, EditPrediction, EditPredictionProvider};
 use futures::AsyncReadExt;
 use gpui::{App, Context, Entity, EntityId, SharedString, Task};
 use http_client::{AsyncBody, HttpClient, Method};
-use language::{Anchor, Buffer, BufferSnapshot, OffsetRangeExt, Point, ToOffset};
+use language::{Anchor, Buffer, BufferSnapshot, OffsetRangeExt, Point, ToOffset, ToPoint};
 use parking_lot::Mutex;
 use prost::Message;
 use settings::Settings;
@@ -27,10 +28,11 @@ use crate::proto::{
     FilesyncUpdateWithModelVersion, FsUploadErrorType, RecordCppFateRequest, StreamCppRequest,
     StreamCppResponse,
 };
+use crate::request_logger::RequestLogger;
 use crate::request_manager::{
     CachedSuggestion, NextActionType, RequestStateManager, TriggerSource,
 };
-use crate::smart_context::SmartContextEngine;
+use crate::smart_context::{LspLocation, LspResolver, SmartContextEngine};
 use crate::snapshot_differ::SnapshotDiffer;
 use project::Project;
 
@@ -87,6 +89,12 @@ pub struct CtabCompletionProvider {
     is_multidiff_model: bool,
     /// Request state manager for debouncing, caching, and next action handling
     request_state: Arc<RequestStateManager>,
+    /// Request logger for debugging (writes to rotating files)
+    request_logger: Arc<RequestLogger>,
+    /// Set of file paths that have been warmed up (to avoid redundant warmup)
+    warmed_up_files: HashSet<String>,
+    /// Pending LSP warmup task (detached, but kept for potential cancellation)
+    pending_warmup: Option<Task<()>>,
 }
 
 struct CompletionState {
@@ -196,6 +204,9 @@ impl CtabCompletionProvider {
             is_fused_cursor_prediction_model: true, // Default to true (most models now support this)
             is_multidiff_model: true,               // Default to true
             request_state: Arc::new(RequestStateManager::new()),
+            request_logger: Arc::new(RequestLogger::new()),
+            warmed_up_files: HashSet::new(),
+            pending_warmup: None,
         }
     }
 
@@ -312,6 +323,120 @@ impl CtabCompletionProvider {
             _ => "plaintext",
         }
         .to_string()
+    }
+
+    /// Trigger LSP warmup for a newly opened file
+    ///
+    /// This extracts important symbols from the file (imports, declarations, identifiers)
+    /// and asynchronously requests LSP definitions to pre-populate the cache.
+    fn trigger_lsp_warmup(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        file_path: &str,
+        snapshot: &BufferSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        let language_id = Self::detect_language(file_path);
+
+        // Extract symbols to warmup
+        let symbols =
+            self.smart_context
+                .extract_symbols_for_warmup(snapshot, file_path, &language_id);
+
+        if symbols.is_empty() {
+            return;
+        }
+
+        log::info!(
+            "LSP warmup: Pre-fetching {} symbols for {}",
+            symbols.len(),
+            file_path
+        );
+
+        // Get project for LSP requests
+        let Some(project) = self.smart_context.project() else {
+            return;
+        };
+
+        let lsp_resolver = self.smart_context.lsp_resolver().clone();
+        let buffer = buffer.clone();
+        let file_path = file_path.to_string();
+
+        // Spawn async task to request definitions for each symbol
+        let task = cx.spawn(async move |_, cx| {
+            for (symbol, offset) in symbols {
+                // Check if already cached
+                if lsp_resolver.has_cached_symbol(&file_path, &symbol, offset) {
+                    continue;
+                }
+
+                // Create anchor at the symbol's position
+                let position = match buffer.read_with(cx, |b, _| {
+                    let snap = b.snapshot();
+                    snap.anchor_at(offset, language::Bias::Left)
+                }) {
+                    Ok(pos) => pos,
+                    Err(_) => continue,
+                };
+
+                // Request definitions through project
+                let definitions_result =
+                    project.update(cx, |project, cx| project.definitions(&buffer, position, cx));
+
+                let definitions = match definitions_result {
+                    Ok(task) => task.await.ok().flatten().unwrap_or_default(),
+                    Err(_) => continue,
+                };
+
+                // Convert to LspLocation and cache
+                let locations: Vec<LspLocation> = definitions
+                    .into_iter()
+                    .filter_map(|link| {
+                        let target = link.target;
+                        let result = target.buffer.read_with(cx, |b, _cx| {
+                            let path = b.file()?.path().as_unix_str().to_string();
+                            let snap = b.snapshot();
+                            let content: String = snap
+                                .text_for_range(
+                                    target.range.start.to_offset(&snap)
+                                        ..target.range.end.to_offset(&snap),
+                                )
+                                .collect();
+                            let start_point = target.range.start.to_point(&snap);
+                            let end_point = target.range.end.to_point(&snap);
+                            Some((path, content, start_point, end_point))
+                        });
+
+                        result
+                            .ok()
+                            .flatten()
+                            .map(|(path, content, start_point, end_point)| LspLocation {
+                                file_path: path,
+                                range: start_point..end_point,
+                                content,
+                            })
+                    })
+                    .collect();
+
+                if !locations.is_empty() {
+                    lsp_resolver.cache_definitions(&file_path, &symbol, offset, locations.clone());
+                    log::debug!(
+                        "LSP warmup: Cached {} definitions for '{}'",
+                        locations.len(),
+                        symbol
+                    );
+                }
+
+                // Small delay to avoid overwhelming LSP server
+                cx.background_executor()
+                    .timer(Duration::from_millis(5))
+                    .await;
+            }
+
+            log::info!("LSP warmup: Completed for {}", file_path);
+        });
+
+        self.pending_warmup = Some(task);
     }
 
     /// Fetches completion from the Cursor API with proper streaming support.
@@ -1166,10 +1291,13 @@ impl CtabCompletionProvider {
 
         let body = request.encode_to_vec();
 
+        // CppConfig is a Unary RPC method, so use application/proto (no envelope)
+        // Only ServerStreaming methods use application/connect+proto with envelope
         let http_request = http_client::Request::builder()
             .method(Method::POST)
             .uri(&url)
             .header("Content-Type", "application/proto")
+            .header("Connect-Protocol-Version", "1")
             .header("Authorization", format!("Bearer {}", auth_token))
             .header(&client_key_header, &client_key)
             .header("x-cursor-client-version", CLIENT_VERSION)
@@ -1204,7 +1332,53 @@ impl CtabCompletionProvider {
             return Ok(CppConfigResponse::default());
         }
 
-        let config = match CppConfigResponse::decode(&body_bytes[..]) {
+        // Try multiple decoding strategies to handle different server response formats
+        // Strategy 1: Try to strip Connect-RPC envelope if present
+        // Connect-RPC envelope format: [flags(1)][length(4)][payload]
+        // flags can be: 0=uncompressed, 1=compressed, or other values for extensions
+        let config = if body_bytes.len() >= 5 {
+            let flags = body_bytes[0];
+            let length =
+                u32::from_be_bytes([body_bytes[1], body_bytes[2], body_bytes[3], body_bytes[4]])
+                    as usize;
+
+            // Check if this looks like a valid Connect-RPC envelope
+            // Accept flags 0-7 (3 bits) and verify length matches remaining bytes
+            let has_valid_envelope = flags <= 7 && length == body_bytes.len() - 5 && length > 0;
+
+            if has_valid_envelope {
+                log::debug!(
+                    "Ctab: CppConfig stripping Connect-RPC envelope (flags={}, length={})",
+                    flags,
+                    length
+                );
+                let payload = &body_bytes[5..];
+                CppConfigResponse::decode(payload)
+            } else {
+                // Not a valid envelope, try raw decode first
+                log::debug!(
+                    "Ctab: CppConfig no valid envelope detected (flags={}, length={}), trying raw decode",
+                    flags,
+                    length
+                );
+                let raw_result = CppConfigResponse::decode(&body_bytes[..]);
+
+                // If raw decode fails and we have enough bytes, try stripping 5 bytes anyway
+                // Some servers might send envelope with non-standard flags
+                if raw_result.is_err() && body_bytes.len() > 5 {
+                    log::debug!(
+                        "Ctab: CppConfig raw decode failed, trying with 5-byte header stripped"
+                    );
+                    CppConfigResponse::decode(&body_bytes[5..]).or(raw_result)
+                } else {
+                    raw_result
+                }
+            }
+        } else {
+            CppConfigResponse::decode(&body_bytes[..])
+        };
+
+        let config = match config {
             Ok(c) => c,
             Err(e) => {
                 log::warn!(
@@ -1632,14 +1806,33 @@ impl EditPredictionProvider for CtabCompletionProvider {
                 let remaining_edits = session.queue.len();
                 let has_cursor_prediction = session.cursor_prediction.is_some();
 
+                // Use the range directly from the API - the API pre-computes adjusted positions
+                // for multidiff edits, so we should NOT apply additional cumulative offsets.
+                // The API accounts for line changes from previous edits when generating ranges.
+                let original_range = next_edit.range;
+
                 log::info!(
-                    "Ctab: [Multidiff] Using cached followup edit ({} remaining, has_cursor_prediction={})",
+                    "Ctab: [Multidiff] Using cached followup edit ({} remaining, has_cursor_prediction={}, range {:?})",
                     remaining_edits,
-                    has_cursor_prediction
+                    has_cursor_prediction,
+                    original_range,
                 );
+
+                // Log the actual text content for debugging (truncated)
+                let text_preview: String = next_edit.text.chars().take(80).collect();
+                log::info!("Ctab: [Multidiff] Edit text preview: {:?}", text_preview);
 
                 // Pre-compute edits for the followup
                 let buffer_snapshot = buffer_ref.snapshot();
+                let max_line = buffer_snapshot.max_point().row;
+                log::info!(
+                    "Ctab: [Multidiff] Buffer state: max_line={}, cursor_row={}",
+                    max_line,
+                    buffer_snapshot
+                        .offset_to_point(cursor_position.to_offset(&buffer_snapshot))
+                        .row
+                );
+
                 let cursor_offset = cursor_position.to_offset(&buffer_snapshot);
                 let cursor_point = buffer_snapshot.offset_to_point(cursor_offset);
 
@@ -1649,7 +1842,7 @@ impl EditPredictionProvider for CtabCompletionProvider {
                     cursor_offset,
                     cursor_point,
                     &next_edit.text,
-                    Some(next_edit.range),
+                    Some(original_range),
                 );
 
                 let precomputed_edits = if diff_result.edits.is_empty() {
@@ -1667,7 +1860,7 @@ impl EditPredictionProvider for CtabCompletionProvider {
                     binding_id: next_edit.binding_id,
                     range_start: cursor_position,
                     range_end: cursor_position,
-                    api_range: Some(next_edit.range),
+                    api_range: Some(original_range),
                     should_retrigger,
                     precomputed_edits,
                     original_snapshot: Some(buffer_snapshot),
@@ -1838,6 +2031,14 @@ impl EditPredictionProvider for CtabCompletionProvider {
             .unwrap_or_else(|| "untitled".to_string());
 
         self.file_extension = file_path.rsplit('.').next().map(|s| s.to_string());
+
+        // Check if this is a new file (not yet warmed up) and trigger LSP warmup
+        let is_new_file = !self.warmed_up_files.contains(&file_path);
+        if is_new_file {
+            self.warmed_up_files.insert(file_path.clone());
+            self.trigger_lsp_warmup(&buffer, &file_path, &snapshot, cx);
+        }
+
         self.current_file_path = Some(file_path.clone());
 
         // Record file edit in smart context tracker
@@ -1877,6 +2078,72 @@ impl EditPredictionProvider for CtabCompletionProvider {
         // Add enclosing scope context (TreeSitter based, synchronous)
         if let Some(enclosing_context) = self.get_enclosing_context(&snapshot, offset, &file_path) {
             context_items.push(enclosing_context);
+        }
+
+        // Trigger async LSP definition lookup to populate cache for next request
+        if let Some(symbol) = LspResolver::get_symbol_at_cursor(&snapshot, offset) {
+            if let Some(project) = self.smart_context.project() {
+                let lsp_resolver = self.smart_context.lsp_resolver().clone();
+                let lsp_file_path = file_path.clone();
+                let lsp_offset = offset;
+                let lsp_buffer = buffer.clone();
+
+                cx.spawn(async move |_, cx| {
+                    let definitions_result = project.update(cx, |project, cx| {
+                        project.definitions(&lsp_buffer, cursor_position, cx)
+                    });
+
+                    let definitions = match definitions_result {
+                        Ok(task) => task.await.ok().flatten().unwrap_or_default(),
+                        Err(_) => return,
+                    };
+
+                    let locations: Vec<LspLocation> = definitions
+                        .into_iter()
+                        .filter_map(|link| {
+                            let target = link.target;
+                            let target_buffer = target.buffer.read_with(cx, |b, _cx| {
+                                let path = b.file()?.path().as_unix_str().to_string();
+                                let snapshot = b.snapshot();
+                                let content: String = snapshot
+                                    .text_for_range(
+                                        target.range.start.to_offset(&snapshot)
+                                            ..target.range.end.to_offset(&snapshot),
+                                    )
+                                    .collect();
+                                let start_point = target.range.start.to_point(&snapshot);
+                                let end_point = target.range.end.to_point(&snapshot);
+                                Some((path, content, start_point, end_point))
+                            });
+
+                            target_buffer.ok().flatten().map(
+                                |(path, content, start_point, end_point)| LspLocation {
+                                    file_path: path,
+                                    range: start_point..end_point,
+                                    content,
+                                },
+                            )
+                        })
+                        .collect();
+
+                    if !locations.is_empty() {
+                        log::info!(
+                            "Ctab: LSP cached {} definitions for symbol '{}' at {}:{}",
+                            locations.len(),
+                            symbol,
+                            lsp_file_path,
+                            lsp_offset
+                        );
+                        lsp_resolver.cache_definitions(
+                            &lsp_file_path,
+                            &symbol,
+                            lsp_offset,
+                            locations,
+                        );
+                    }
+                })
+                .detach();
+            }
         }
 
         // Build and retrieve diff history with timestamps
@@ -2031,24 +2298,26 @@ impl EditPredictionProvider for CtabCompletionProvider {
                 contents: content.clone(),
                 rely_on_filesync,
                 sha_256_hash: Some(content_hash),
-                // Cursor API uses 1-indexed line/column numbers
+                // Cursor API uses 0-indexed line/column numbers (same as VS Code)
                 cursor_position: Some(CursorPosition {
-                    line: (point.row + 1) as i32,
-                    column: (point.column + 1) as i32,
+                    line: point.row as i32,
+                    column: point.column as i32,
                 }),
                 // Selection: use cursor position as both start and end (no selection = cursor at point)
                 selection: Some(CursorRange {
                     start_position: Some(CursorPosition {
-                        line: (point.row + 1) as i32,
-                        column: (point.column + 1) as i32,
+                        line: point.row as i32,
+                        column: point.column as i32,
                     }),
                     end_position: Some(CursorPosition {
-                        line: (point.row + 1) as i32,
-                        column: (point.column + 1) as i32,
+                        line: point.row as i32,
+                        column: point.column as i32,
                     }),
                 }),
                 total_number_of_lines: content.lines().count() as i32,
-                language_id: Self::detect_language(&file_path),
+                // IMPORTANT: Cursor sends empty string for languageId
+                // The server determines language from file extension
+                language_id: String::new(),
                 file_version: Some(file_version),
                 workspace_root_path: String::new(),
                 line_ending: Some("\n".to_string()),
@@ -2115,6 +2384,20 @@ impl EditPredictionProvider for CtabCompletionProvider {
             code_results,
         };
 
+        // Log request context to file for debugging
+        let extra_info = format!(
+            "Request ID: {}\nEndpoint: {}{}\nDebounce: {}ms",
+            generate_workspace_id(), // Use as pseudo request ID for logging
+            base_url,
+            stream_path,
+            debounce_ms
+        );
+        self.request_logger.log_request(&request, &extra_info);
+        log::info!(
+            "Ctab: Request logged to {:?}",
+            self.request_logger.log_dir()
+        );
+
         let http_client = self.http_client.clone();
         let filesync_client_key = self.filesync_client_key.clone();
         let filesync_cookie = self.filesync_cookie.clone();
@@ -2147,6 +2430,12 @@ impl EditPredictionProvider for CtabCompletionProvider {
         // Capture buffer text length as version proxy for cache
         let buffer_version = buffer.read(cx).text().len();
 
+        // Capture symbol and file path for LSP wait check
+        let lsp_symbol = LspResolver::get_symbol_at_cursor(&snapshot, offset);
+        let lsp_file_path = file_path.clone();
+        let lsp_offset = offset;
+        let smart_context_lsp = self.smart_context.lsp_resolver().clone();
+
         self.pending_refresh = Some(cx.spawn(async move |this, cx| {
             // Debounce: wait before proceeding
             if debounce {
@@ -2160,6 +2449,36 @@ impl EditPredictionProvider for CtabCompletionProvider {
                     &request_id[..16.min(request_id.len())]
                 );
                 return Ok(());
+            }
+
+            // LSP cache warmup: if we have a symbol but no cached definitions yet,
+            // wait a bit longer to allow the async LSP query to complete.
+            // This improves context quality for the first request on a symbol.
+            if let Some(ref symbol) = lsp_symbol {
+                if !smart_context_lsp.has_cached_symbol(&lsp_file_path, symbol, lsp_offset) {
+                    // Wait additional time for LSP to populate cache (up to 150ms in 50ms increments)
+                    for _ in 0..3 {
+                        gpui::Timer::after(Duration::from_millis(50)).await;
+
+                        // Check if cancelled while waiting
+                        if request_state.debounce.is_cancelled(&request_id) {
+                            log::debug!(
+                                "Ctab: Request {} cancelled during LSP wait",
+                                &request_id[..16.min(request_id.len())]
+                            );
+                            return Ok(());
+                        }
+
+                        // Check if LSP cache is now populated
+                        if smart_context_lsp.has_cached_symbol(&lsp_file_path, symbol, lsp_offset) {
+                            log::info!(
+                                "Ctab: LSP cache populated for '{}' after extra wait",
+                                symbol
+                            );
+                            break;
+                        }
+                    }
+                }
             }
 
             // Use multidiff-aware fetch
@@ -2247,11 +2566,31 @@ impl EditPredictionProvider for CtabCompletionProvider {
                         if has_followups {
                             let followup_edits: Vec<EditPart> =
                                 parse_result.edits[1..].to_vec();
+
                             log::info!(
                                 "Ctab: [Multidiff] Queueing {} followup edits, has_cursor_prediction={}",
                                 followup_edits.len(),
-                                parse_result.cursor_prediction.is_some()
+                                parse_result.cursor_prediction.is_some(),
                             );
+
+                            // Log the actual text content for debugging (truncated)
+                            let text_preview: String = first_edit.text.chars().take(100).collect();
+                            log::info!(
+                                "Ctab: [Multidiff] First edit text preview: {:?}",
+                                text_preview
+                            );
+
+                            // Log all followup edit ranges for debugging
+                            for (i, edit) in followup_edits.iter().enumerate() {
+                                let edit_text_preview: String = edit.text.chars().take(50).collect();
+                                log::info!(
+                                    "Ctab: [Multidiff] Followup #{}: range=({}, {}), text={:?}",
+                                    i + 1,
+                                    edit.range.0,
+                                    edit.range.1,
+                                    edit_text_preview
+                                );
+                            }
 
                             let buffer_ref = buffer_for_diff.read(cx);
                             this.followup_session = Some(FollowupSession {
@@ -2570,6 +2909,9 @@ impl EditPredictionProvider for CtabCompletionProvider {
                             .map(|id| SharedString::from(id.clone())),
                         edits,
                         edit_preview: None,
+                        // Autoscroll when this is part of a multidiff sequence (has more followups)
+                        // This ensures users can see the next edit location
+                        autoscroll: completion.should_retrigger,
                     });
                 }
             }

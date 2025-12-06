@@ -58,7 +58,7 @@ const MAX_CONTEXT_ITEMS: usize = 15;
 const MAX_RECENT_FILES: usize = 20;
 
 /// Maximum content size per context item (bytes)
-const MAX_CONTEXT_ITEM_SIZE: usize = 8_000;
+const MAX_CONTEXT_ITEM_SIZE: usize = 32_000;
 
 /// Context cache TTL (seconds)
 const CONTEXT_CACHE_TTL_SECS: u64 = 30;
@@ -1308,12 +1308,13 @@ struct LspCacheEntry {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LspLocation {
-    file_path: String,
-    range: Range<Point>,
-    content: String,
+    pub file_path: String,
+    pub range: Range<Point>,
+    pub content: String,
 }
 
 /// LSP-based symbol resolver
+#[derive(Clone)]
 pub struct LspResolver {
     /// Cache of LSP results by (file_path, symbol_name, offset)
     cache: Arc<RwLock<HashMap<(String, String, usize), LspCacheEntry>>>,
@@ -1411,6 +1412,55 @@ impl LspResolver {
                 None
             }
         })
+    }
+
+    /// Cache LSP definitions for a symbol (called from completion provider)
+    pub fn cache_definitions(
+        &self,
+        file_path: &str,
+        symbol: &str,
+        offset: usize,
+        definitions: Vec<LspLocation>,
+    ) {
+        let key = (file_path.to_string(), symbol.to_string(), offset);
+        let mut cache = self.cache.write();
+        let entry = cache.entry(key).or_insert_with(|| LspCacheEntry {
+            definitions: vec![],
+            references: vec![],
+            cached_at: Instant::now(),
+        });
+        entry.definitions = definitions;
+        entry.cached_at = Instant::now();
+    }
+
+    /// Check if we have valid cached definitions for a symbol
+    ///
+    /// Returns true if there are cached definitions that haven't expired.
+    /// This is useful for determining whether to wait for LSP before sending a request.
+    pub fn has_cached_symbol(&self, file_path: &str, symbol: &str, offset: usize) -> bool {
+        let cache = self.cache.read();
+        let key = (file_path.to_string(), symbol.to_string(), offset);
+        cache.get(&key).map_or(false, |entry| {
+            entry.cached_at.elapsed().as_secs() < LSP_CACHE_TTL_SECS
+                && !entry.definitions.is_empty()
+        })
+    }
+
+    /// Check if there's any pending LSP request for this symbol
+    ///
+    /// Returns true if we should wait for LSP cache to be populated.
+    pub fn should_wait_for_lsp(&self, file_path: &str, symbol: &str, offset: usize) -> bool {
+        // If we already have cached data, no need to wait
+        if self.has_cached_symbol(file_path, symbol, offset) {
+            return false;
+        }
+        // If the symbol looks like a valid identifier (not too short), we should wait
+        symbol.len() >= 2
+    }
+
+    /// Get the project reference
+    pub fn project(&self) -> Option<Entity<Project>> {
+        self.project.as_ref().and_then(|p| p.upgrade())
     }
 
     /// Request LSP definitions (async, caches result)
@@ -1748,6 +1798,16 @@ impl SmartContextEngine {
             syntax_index: SyntaxIndex::new(),
             indexing_task: None,
         }
+    }
+
+    /// Get the LSP resolver for caching definitions
+    pub fn lsp_resolver(&self) -> &LspResolver {
+        &self.lsp_resolver
+    }
+
+    /// Get the project reference
+    pub fn project(&self) -> Option<Entity<Project>> {
+        self.project.clone()
     }
 
     /// Record that a file was viewed
@@ -2516,6 +2576,259 @@ impl SmartContextEngine {
                 })
             })
             .collect()
+    }
+
+    /// Warmup LSP cache by pre-fetching definitions for important symbols
+    ///
+    /// This method extracts symbols from imports and declarations in the current file,
+    /// then requests LSP definitions for each symbol. The results are cached in
+    /// `LspResolver` for faster access during completion requests.
+    ///
+    /// Returns a list of (symbol, offset) pairs to warmup. The caller is responsible
+    /// for spawning async tasks to request definitions.
+    ///
+    /// Call this when a file is first opened or gains focus to pre-populate the cache.
+    pub fn extract_symbols_for_warmup(
+        &self,
+        snapshot: &BufferSnapshot,
+        file_path: &str,
+        language_id: &str,
+    ) -> Vec<(String, usize)> {
+        // Collect symbols to warmup from multiple sources
+        let mut symbols_to_warmup: Vec<(String, usize)> = Vec::new();
+
+        // 1. Extract symbols from imports
+        let imports = ImportAnalyzer::parse_imports(snapshot, language_id);
+        for import in &imports {
+            for symbol in &import.symbols {
+                if symbol.len() >= 2 && !symbol.chars().all(|c| c.is_numeric()) {
+                    // Use import line position as approximate offset
+                    let offset = snapshot
+                        .point_to_offset(Point::new(import.line, 0))
+                        .min(snapshot.len());
+                    symbols_to_warmup.push((symbol.clone(), offset));
+                }
+            }
+        }
+
+        // 2. Extract top-level declarations from syntax index
+        let declarations = self.syntax_index.get_by_file(file_path);
+        for decl in declarations {
+            if decl.name.len() >= 2 {
+                let offset = snapshot
+                    .point_to_offset(Point::new(decl.line_range.start, 0))
+                    .min(snapshot.len());
+                symbols_to_warmup.push((decl.name.clone(), offset));
+            }
+        }
+
+        // 3. Extract identifiers from first ~100 lines (visible area heuristic)
+        let content = snapshot.text();
+        let mut line_count = 0;
+        let mut current_word = String::new();
+        let mut word_start = 0;
+
+        for (i, c) in content.char_indices() {
+            if c == '\n' {
+                line_count += 1;
+                if line_count > 100 {
+                    break;
+                }
+            }
+
+            if c.is_alphanumeric() || c == '_' {
+                if current_word.is_empty() {
+                    word_start = i;
+                }
+                current_word.push(c);
+            } else {
+                if current_word.len() >= 3
+                    && !current_word.chars().all(|c| c.is_numeric())
+                    && !is_keyword(&current_word, language_id)
+                {
+                    symbols_to_warmup.push((current_word.clone(), word_start));
+                }
+                current_word.clear();
+            }
+        }
+
+        // Handle last word
+        if current_word.len() >= 3
+            && !current_word.chars().all(|c| c.is_numeric())
+            && !is_keyword(&current_word, language_id)
+        {
+            symbols_to_warmup.push((current_word, word_start));
+        }
+
+        // Deduplicate symbols (keep first occurrence)
+        let mut seen: HashSet<String> = HashSet::new();
+        symbols_to_warmup.retain(|(symbol, _)| {
+            if seen.contains(symbol) {
+                false
+            } else {
+                seen.insert(symbol.clone());
+                true
+            }
+        });
+
+        // Limit to avoid overwhelming LSP
+        const MAX_WARMUP_SYMBOLS: usize = 30;
+        symbols_to_warmup.truncate(MAX_WARMUP_SYMBOLS);
+
+        symbols_to_warmup
+    }
+}
+
+/// Check if a word is a language keyword (to skip during warmup)
+fn is_keyword(word: &str, language_id: &str) -> bool {
+    match language_id {
+        "rust" => matches!(
+            word,
+            "fn" | "let"
+                | "mut"
+                | "const"
+                | "static"
+                | "pub"
+                | "use"
+                | "mod"
+                | "struct"
+                | "enum"
+                | "impl"
+                | "trait"
+                | "type"
+                | "where"
+                | "for"
+                | "loop"
+                | "while"
+                | "if"
+                | "else"
+                | "match"
+                | "return"
+                | "break"
+                | "continue"
+                | "async"
+                | "await"
+                | "move"
+                | "self"
+                | "Self"
+                | "super"
+                | "crate"
+                | "true"
+                | "false"
+                | "Some"
+                | "None"
+                | "Ok"
+                | "Err"
+        ),
+        "typescript" | "typescriptreact" | "javascript" | "javascriptreact" => matches!(
+            word,
+            "function"
+                | "const"
+                | "let"
+                | "var"
+                | "if"
+                | "else"
+                | "for"
+                | "while"
+                | "do"
+                | "switch"
+                | "case"
+                | "break"
+                | "continue"
+                | "return"
+                | "throw"
+                | "try"
+                | "catch"
+                | "finally"
+                | "class"
+                | "extends"
+                | "implements"
+                | "interface"
+                | "type"
+                | "enum"
+                | "import"
+                | "export"
+                | "from"
+                | "as"
+                | "default"
+                | "async"
+                | "await"
+                | "new"
+                | "this"
+                | "super"
+                | "true"
+                | "false"
+                | "null"
+                | "undefined"
+                | "void"
+                | "typeof"
+                | "instanceof"
+        ),
+        "python" => matches!(
+            word,
+            "def"
+                | "class"
+                | "if"
+                | "elif"
+                | "else"
+                | "for"
+                | "while"
+                | "try"
+                | "except"
+                | "finally"
+                | "with"
+                | "as"
+                | "import"
+                | "from"
+                | "return"
+                | "yield"
+                | "raise"
+                | "pass"
+                | "break"
+                | "continue"
+                | "and"
+                | "or"
+                | "not"
+                | "in"
+                | "is"
+                | "lambda"
+                | "True"
+                | "False"
+                | "None"
+                | "self"
+                | "async"
+                | "await"
+        ),
+        "go" => matches!(
+            word,
+            "func"
+                | "var"
+                | "const"
+                | "type"
+                | "struct"
+                | "interface"
+                | "map"
+                | "chan"
+                | "if"
+                | "else"
+                | "for"
+                | "range"
+                | "switch"
+                | "case"
+                | "default"
+                | "break"
+                | "continue"
+                | "return"
+                | "go"
+                | "defer"
+                | "select"
+                | "package"
+                | "import"
+                | "true"
+                | "false"
+                | "nil"
+        ),
+        _ => false,
     }
 }
 

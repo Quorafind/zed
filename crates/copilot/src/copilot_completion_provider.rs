@@ -251,6 +251,7 @@ impl EditPredictionProvider for CopilotCompletionProvider {
                     id: None,
                     edits: vec![(position..position, completion_text.into())],
                     edit_preview: None,
+                    autoscroll: false,
                 })
             }
         } else {

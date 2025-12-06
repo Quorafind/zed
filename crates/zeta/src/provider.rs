@@ -217,6 +217,7 @@ impl EditPredictionProvider for ZetaEditPredictionProvider {
             id: Some(prediction.id.to_string().into()),
             edits: edits[edit_start_ix..edit_end_ix].to_vec(),
             edit_preview: Some(prediction.edit_preview.clone()),
+            autoscroll: false,
         })
     }
 }

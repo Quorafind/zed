@@ -519,6 +519,8 @@ pub enum TriggerSource {
     CursorPrediction,
     /// Triggered by document change event
     DocumentChange,
+    /// Triggered by cursor idle (no movement for a period of time)
+    Idle,
 }
 
 /// Manages smart triggering of completions

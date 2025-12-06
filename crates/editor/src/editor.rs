@@ -88,6 +88,7 @@ use code_context_menus::{
 };
 use collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use convert_case::{Case, Casing};
+use ctab::CtabSettings;
 use dap::TelemetrySpawnLocation;
 use display_map::*;
 use edit_prediction::{EditPredictionProvider, EditPredictionProviderHandle};
@@ -619,6 +620,8 @@ enum EditPrediction {
         edit_preview: Option<EditPreview>,
         display_mode: EditDisplayMode,
         snapshot: BufferSnapshot,
+        /// Whether to autoscroll to the edit location after accepting
+        autoscroll: bool,
     },
     /// Move to a specific location in the active editor
     MoveWithin {
@@ -1122,6 +1125,8 @@ pub struct Editor {
     edit_prediction_preview: EditPredictionPreview,
     edit_prediction_indent_conflict: bool,
     edit_prediction_requires_modifier_in_indent_conflict: bool,
+    /// Task for idle cursor prediction trigger
+    edit_prediction_idle_trigger_task: Option<Task<()>>,
     next_inlay_id: usize,
     next_color_inlay_id: usize,
     _subscriptions: Vec<Subscription>,
@@ -2260,6 +2265,7 @@ impl Editor {
             edit_prediction_settings: EditPredictionSettings::Disabled,
             edit_prediction_indent_conflict: false,
             edit_prediction_requires_modifier_in_indent_conflict: true,
+            edit_prediction_idle_trigger_task: None,
             custom_context_menu: None,
             show_git_blame_gutter: false,
             show_git_blame_inline: false,
@@ -3319,6 +3325,9 @@ impl Editor {
             if self.git_blame_inline_enabled {
                 self.start_inline_blame_timer(window, cx);
             }
+
+            // Start idle trigger timer for edit predictions
+            self.start_edit_prediction_idle_trigger(window, cx);
         }
 
         self.blink_manager.update(cx, BlinkManager::pause_blinking);
@@ -7234,6 +7243,62 @@ impl Editor {
         Some(())
     }
 
+    /// Starts an idle trigger timer for edit predictions.
+    /// When the cursor stays in the same position for the configured duration,
+    /// a completion request will be triggered automatically.
+    fn start_edit_prediction_idle_trigger(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Cancel any existing idle trigger task
+        self.edit_prediction_idle_trigger_task = None;
+
+        // Check if we should trigger idle predictions
+        if !self.should_show_edit_predictions() || !self.is_focused(window) {
+            return;
+        }
+
+        // Check if there's already an active prediction - no need to trigger idle
+        if self.has_active_edit_prediction() {
+            return;
+        }
+
+        // Get idle trigger delay from Ctab settings
+        let idle_trigger_ms = CtabSettings::get_global(cx).idle_trigger_ms;
+
+        // If idle trigger is disabled (0), don't start the timer
+        if idle_trigger_ms == 0 {
+            return;
+        }
+
+        // Store the current cursor position to compare later
+        let cursor_position = self.selections.newest_anchor().head();
+
+        // Spawn a task that waits for the idle duration and then triggers prediction
+        self.edit_prediction_idle_trigger_task =
+            Some(cx.spawn_in(window, async move |this, cx| {
+                // Wait for the idle duration
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(idle_trigger_ms))
+                    .await;
+
+                // After waiting, check if cursor is still in the same position
+                this.update_in(cx, |editor, window, cx| {
+                    let current_cursor = editor.selections.newest_anchor().head();
+
+                    // Only trigger if:
+                    // 1. Cursor hasn't moved
+                    // 2. No active prediction exists
+                    // 3. Editor is still focused
+                    if current_cursor == cursor_position
+                        && !editor.has_active_edit_prediction()
+                        && editor.is_focused(window)
+                    {
+                        log::debug!("Ctab: Idle trigger activated after {}ms", idle_trigger_ms);
+                        editor.refresh_edit_prediction(true, false, window, cx);
+                    }
+                })
+                .ok();
+            }));
+    }
+
     fn show_edit_predictions_in_menu(&self) -> bool {
         match self.edit_prediction_settings {
             EditPredictionSettings::Disabled => false,
@@ -7522,7 +7587,9 @@ impl Editor {
                         .detach_and_log_err(cx);
                 }
             }
-            EditPrediction::Edit { edits, .. } => {
+            EditPrediction::Edit {
+                edits, autoscroll, ..
+            } => {
                 self.report_edit_prediction_event(
                     active_edit_prediction.completion_id.clone(),
                     true,
@@ -7543,7 +7610,13 @@ impl Editor {
                     buffer.edit(edits.iter().cloned(), None, cx)
                 });
 
-                self.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                // Use autoscroll for multidiff followups so users can see the next edit
+                let selection_effects = if *autoscroll {
+                    SelectionEffects::scroll(Autoscroll::newest())
+                } else {
+                    SelectionEffects::no_scroll()
+                };
+                self.change_selections(selection_effects, window, cx, |s| {
                     s.select_anchor_ranges([last_edit_end..last_edit_end]);
                 });
 
@@ -7998,12 +8071,13 @@ impl Editor {
 
         let edit_prediction = provider.suggest(&buffer, cursor_buffer_position, cx)?;
 
-        let (completion_id, edits, edit_preview) = match edit_prediction {
+        let (completion_id, edits, edit_preview, autoscroll) = match edit_prediction {
             edit_prediction::EditPrediction::Local {
                 id,
                 edits,
                 edit_preview,
-            } => (id, edits, edit_preview),
+                autoscroll,
+            } => (id, edits, edit_preview, autoscroll),
             edit_prediction::EditPrediction::Jump {
                 id,
                 snapshot,
@@ -8122,6 +8196,7 @@ impl Editor {
                 edit_preview,
                 display_mode,
                 snapshot,
+                autoscroll,
             }
         };
 
@@ -8803,6 +8878,7 @@ impl Editor {
                 edit_preview,
                 display_mode: EditDisplayMode::DiffPopover,
                 snapshot,
+                ..
             } => self.render_edit_prediction_diff_popover(
                 text_bounds,
                 content_origin,
@@ -9751,7 +9827,7 @@ impl Editor {
                 edits,
                 edit_preview,
                 snapshot,
-                display_mode: _,
+                ..
             } => {
                 let first_edit_row = edits.first()?.0.start.text_anchor.to_point(snapshot).row;
 

@@ -340,6 +340,7 @@ impl EditPredictionProvider for CodestralCompletionProvider {
             id: None,
             edits,
             edit_preview: Some(current_completion.edit_preview.clone()),
+            autoscroll: false,
         })
     }
 }

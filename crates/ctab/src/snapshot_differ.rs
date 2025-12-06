@@ -232,7 +232,7 @@ impl SnapshotDiffer {
             let start_line_0 = (start_line_1.max(1) - 1) as u32;
             let end_line_0 = (end_line_1.max(1) - 1) as u32;
 
-            log::debug!(
+            log::info!(
                 "SnapshotDiffer: Using api_range for replacement: lines {}-{} (0-indexed: {}-{})",
                 start_line_1,
                 end_line_1,
@@ -256,6 +256,51 @@ impl SnapshotDiffer {
                 };
             }
 
+            // Handle INSERTION case: start_line > end_line means insert new lines
+            // API returns (N, N-1) to indicate "insert before line N"
+            // We implement this by inserting at the END of line (end_line - 1) with a leading newline
+            if start_line_1 > end_line_1 {
+                log::info!(
+                    "SnapshotDiffer: Detected INSERTION (start > end): inserting new lines before line {}",
+                    start_line_1
+                );
+
+                // For insertion, we insert at the end of the line BEFORE where we want the new content
+                // If end_line_0 is the target, we insert at the end of end_line_0
+                let insert_line = end_line_0.min(max_line);
+                let insert_offset = snapshot
+                    .point_to_offset(Point::new(insert_line, snapshot.line_len(insert_line)));
+
+                // Prepend newline to the insert text since we're appending to end of previous line
+                let text_with_newline = format!("\n{}", insert_text);
+
+                log::info!(
+                    "SnapshotDiffer: Inserting at end of line {} (offset {}), text_len={}",
+                    insert_line,
+                    insert_offset,
+                    text_with_newline.len()
+                );
+                log::info!(
+                    "SnapshotDiffer: Insert text preview: {:?}",
+                    text_with_newline.chars().take(100).collect::<String>()
+                );
+
+                optimizations.push(format!("api_range_insert_after_line_{}", insert_line));
+
+                // Create an insertion edit (empty range)
+                let anchor = snapshot.anchor_after(insert_offset);
+                let edits = vec![(
+                    anchor.clone()..anchor,
+                    Arc::from(text_with_newline.as_str()),
+                )];
+
+                return SnapshotDiffResult {
+                    edits,
+                    optimizations,
+                    confidence: 0.95,
+                };
+            }
+
             let end_line_clamped = end_line_0.min(max_line);
 
             // Calculate the range to replace - FROM LINE START to LINE END
@@ -267,19 +312,12 @@ impl SnapshotDiffer {
                 snapshot.point_to_offset(Point::new(start_line_0, 0))
             };
 
-            let mut replace_end = snapshot.point_to_offset(Point::new(
+            let replace_end = snapshot.point_to_offset(Point::new(
                 end_line_clamped,
                 snapshot.line_len(end_line_clamped),
             ));
 
-            // Handle append scenario where start > end (API returns start > end for insertion)
-            // In this case, replace_start (EOF) may be greater than replace_end (last line end)
-            // Correct it to create an insertion point at EOF
-            if replace_start > replace_end {
-                replace_end = replace_start;
-            }
-
-            log::debug!(
+            log::info!(
                 "SnapshotDiffer: Replacing FULL line range {}..{} (lines {} to {})",
                 replace_start,
                 replace_end,
@@ -291,9 +329,15 @@ impl SnapshotDiffer {
             let replaced_text: String = snapshot
                 .text_for_range(replace_start..replace_end)
                 .collect();
-            log::debug!(
-                "SnapshotDiffer: Text being replaced: {:?}",
+            log::info!(
+                "SnapshotDiffer: Text being replaced (len={}): {:?}",
+                replaced_text.len(),
                 replaced_text.chars().take(100).collect::<String>()
+            );
+            log::info!(
+                "SnapshotDiffer: Replacement text (len={}): {:?}",
+                insert_text.len(),
+                insert_text.chars().take(100).collect::<String>()
             );
 
             optimizations.push(format!(

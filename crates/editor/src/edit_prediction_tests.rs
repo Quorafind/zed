@@ -387,6 +387,7 @@ fn propose_edits<T: ToOffset>(
                 id: None,
                 edits: edits.collect(),
                 edit_preview: None,
+                autoscroll: false,
             }))
         })
     });
@@ -418,6 +419,7 @@ fn propose_edits_non_zed<T: ToOffset>(
                 id: None,
                 edits: edits.collect(),
                 edit_preview: None,
+                autoscroll: false,
             }))
         })
     });
