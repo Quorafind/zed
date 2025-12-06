@@ -3,10 +3,11 @@
 //! This crate provides an edit prediction provider that integrates with
 //! the Cursor AI completion API (api2.cursor.sh) or self-hosted cursor-api servers.
 
-mod completion_differ;
 mod completion_provider;
+mod diagnostics_tracker;
 mod diff_tracker;
 mod file_sync;
+mod request_manager;
 mod smart_context;
 mod snapshot_differ;
 

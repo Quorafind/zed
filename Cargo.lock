@@ -4440,7 +4440,9 @@ dependencies = [
  "settings",
  "sha2",
  "similar",
+ "smol",
  "util",
+ "uuid",
  "worktree",
 ]
 

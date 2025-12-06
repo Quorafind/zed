@@ -70,12 +70,14 @@ const RECENT_FILE_HALF_LIFE_SECS: f64 = 300.0;
 const IDLE_THRESHOLD_SECS: u64 = 5;
 
 /// Prefetch debounce duration (milliseconds)
+#[allow(dead_code)]
 const PREFETCH_DEBOUNCE_MS: u64 = 500;
 
 /// Maximum prefetch results to cache
 const MAX_PREFETCH_RESULTS: usize = 50;
 
 /// Maximum symbols to track for LSP lookups
+#[allow(dead_code)]
 const MAX_LSP_SYMBOLS: usize = 10;
 
 /// LSP result cache TTL (seconds)
@@ -107,12 +109,14 @@ pub enum ContextSource {
     /// From recently edited files
     RecentEdit,
     /// From recently viewed files
+    #[allow(dead_code)]
     RecentView,
     /// From symbol reference analysis (LSP)
     SymbolReference,
     /// From symbol definition (LSP)
     SymbolDefinition,
     /// From enclosing scope (TreeSitter)
+    #[allow(dead_code)]
     EnclosingScope,
     /// From open buffer heuristics
     OpenBuffer,
@@ -128,12 +132,14 @@ pub struct ImportInfo {
     /// The import path (e.g., "std::collections::HashMap")
     pub path: String,
     /// Resolved file path if available
+    #[allow(dead_code)]
     pub resolved_path: Option<PathBuf>,
     /// Imported symbols (empty for wildcard imports)
     pub symbols: Vec<String>,
     /// Whether this is a wildcard import (use foo::*)
     pub is_wildcard: bool,
     /// Line number in source file
+    #[allow(dead_code)]
     pub line: u32,
 }
 
@@ -149,10 +155,12 @@ pub struct RecentFileEntry {
     /// Number of edits in this session
     pub edit_count: u32,
     /// Cached content hash (for change detection)
+    #[allow(dead_code)]
     pub content_hash: Option<u64>,
 }
 
 /// Symbol reference information
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct SymbolReference {
     /// Symbol name
@@ -166,6 +174,7 @@ pub struct SymbolReference {
     pub ref_type: SymbolRefType,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SymbolRefType {
     Definition,
@@ -183,14 +192,18 @@ pub struct Declaration {
     /// File path
     pub file_path: String,
     /// Byte range in file
+    #[allow(dead_code)]
     pub range: Range<usize>,
     /// Line range
+    #[allow(dead_code)]
     pub line_range: Range<u32>,
     /// Signature text (first line or full for short decls)
+    #[allow(dead_code)]
     pub signature: String,
     /// Full declaration text (may be truncated)
     pub full_text: String,
     /// Parent declaration (for nested items)
+    #[allow(dead_code)]
     pub parent: Option<String>,
 }
 
@@ -1051,6 +1064,7 @@ impl Default for RecentFileTracker {
 #[derive(Clone, Debug)]
 struct PrefetchResult {
     /// Search pattern used
+    #[allow(dead_code)]
     pattern: String,
     /// Matched file paths with ranges
     matches: Vec<PrefetchMatch>,
@@ -1059,8 +1073,9 @@ struct PrefetchResult {
 }
 
 #[derive(Clone, Debug)]
-struct PrefetchMatch {
+pub(crate) struct PrefetchMatch {
     file_path: String,
+    #[allow(dead_code)]
     ranges: Vec<Range<usize>>,
     content_preview: String,
 }
@@ -1292,7 +1307,7 @@ struct LspCacheEntry {
 }
 
 #[derive(Clone, Debug)]
-struct LspLocation {
+pub(crate) struct LspLocation {
     file_path: String,
     range: Range<Point>,
     content: String,
@@ -1305,6 +1320,7 @@ pub struct LspResolver {
     /// Project reference
     project: Option<WeakEntity<Project>>,
     /// Pending LSP requests
+    #[allow(dead_code)]
     pending_requests: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -1632,6 +1648,7 @@ impl SyntaxIndex {
     }
 
     /// Get all declarations in a file
+    #[allow(dead_code)]
     pub fn get_by_file(&self, file_path: &str) -> &[Declaration] {
         self.by_file
             .get(file_path)
@@ -1716,6 +1733,7 @@ pub struct SmartContextEngine {
     /// P3: Syntax index
     syntax_index: SyntaxIndex,
     /// Background indexing task
+    #[allow(dead_code)]
     indexing_task: Option<Task<()>>,
 }
 
@@ -1847,11 +1865,36 @@ impl SmartContextEngine {
         let mut symbols = Vec::new();
 
         // Extract identifiers near cursor (within 500 chars)
+        // Use floor_char_boundary/ceil_char_boundary to avoid UTF-8 boundary issues
         let start = cursor_offset.saturating_sub(500);
         let end = (cursor_offset + 500).min(content.len());
 
-        if start < end && end <= content.len() {
-            let region = &content[start..end];
+        // Adjust start to be at a valid UTF-8 character boundary
+        let safe_start = if start == 0 {
+            0
+        } else {
+            // Find the start of the character at or before 'start'
+            let mut idx = start;
+            while idx > 0 && !content.is_char_boundary(idx) {
+                idx -= 1;
+            }
+            idx
+        };
+
+        // Adjust end to be at a valid UTF-8 character boundary
+        let safe_end = if end >= content.len() {
+            content.len()
+        } else {
+            // Find the start of the character at or after 'end'
+            let mut idx = end;
+            while idx < content.len() && !content.is_char_boundary(idx) {
+                idx += 1;
+            }
+            idx
+        };
+
+        if safe_start < safe_end && safe_end <= content.len() {
+            let region = &content[safe_start..safe_end];
             let mut current_word = String::new();
 
             for c in region.chars() {

@@ -43,6 +43,7 @@ impl SnapshotDiffer {
     ///
     /// # Returns
     /// Precise edits with anchor-based ranges
+    #[allow(dead_code)]
     pub fn extract_edits(
         &self,
         snapshot: &BufferSnapshot,
@@ -124,6 +125,7 @@ impl SnapshotDiffer {
     ///
     /// This shrinks edit boundaries to the minimal required change,
     /// avoiding unnecessary replacements of identical content.
+    #[allow(dead_code)]
     fn refine_edits(
         &self,
         snapshot: &BufferSnapshot,
@@ -685,6 +687,7 @@ pub fn interpolate_edits(
 }
 
 /// Compute common prefix length in bytes between two char iterators
+#[allow(dead_code)]
 fn common_prefix<T1, T2>(a: T1, b: T2) -> usize
 where
     T1: Iterator<Item = char>,

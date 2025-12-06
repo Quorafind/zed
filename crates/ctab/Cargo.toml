@@ -39,6 +39,7 @@ serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 sha2.workspace = true
+smol.workspace = true
 hex.workspace = true
 util.workspace = true
 worktree.workspace = true
@@ -46,6 +47,7 @@ rope.workspace = true
 regex.workspace = true
 similar = "2.6"
 prost = "0.13"
+uuid = { version = "1.0", features = ["v4"] }
 
 [build-dependencies]
 prost-build = "0.13"

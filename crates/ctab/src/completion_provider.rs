@@ -11,23 +11,24 @@ use edit_prediction::{Direction, EditPrediction, EditPredictionProvider};
 use futures::AsyncReadExt;
 use gpui::{App, Context, Entity, EntityId, SharedString, Task};
 use http_client::{AsyncBody, HttpClient, Method};
-use language::{
-    Anchor, Buffer, BufferSnapshot, DiagnosticSeverity, OffsetRangeExt, Point, ToOffset,
-};
+use language::{Anchor, Buffer, BufferSnapshot, OffsetRangeExt, Point, ToOffset};
 use parking_lot::Mutex;
 use prost::Message;
 use settings::Settings;
 use sha2::{Digest, Sha256};
 
 use crate::CtabSettings;
+use crate::diagnostics_tracker::DiagnosticsTracker;
 use crate::diff_tracker::DiffTracker;
 use crate::file_sync::FileSyncManager;
 use crate::proto::{
-    CodeBlock, CodeResult, CppAppendRequest, CppConfigRequest, CppConfigResponse, CppContextItem,
-    CppFate, CppFileDiffHistory, CppIntentInfo, CppParameterHint, CurrentFileInfo, CursorPosition,
-    CursorRange, Diagnostic as ProtoDiagnostic, FilesyncUpdateWithModelVersion, FsUploadErrorType,
-    LspSubgraphFullContext, LspSuggestedItems, LspSuggestion, RecordCppFateRequest,
-    StreamCppRequest, StreamCppResponse, diagnostic::DiagnosticSeverity as ProtoDiagnosticSeverity,
+    CppAppendRequest, CppConfigRequest, CppConfigResponse, CppContextItem, CppFate,
+    CppFileDiffHistory, CppIntentInfo, CurrentFileInfo, CursorPosition, CursorRange,
+    FilesyncUpdateWithModelVersion, FsUploadErrorType, RecordCppFateRequest, StreamCppRequest,
+    StreamCppResponse,
+};
+use crate::request_manager::{
+    CachedSuggestion, NextActionType, RequestStateManager, TriggerSource,
 };
 use crate::smart_context::SmartContextEngine;
 use crate::snapshot_differ::SnapshotDiffer;
@@ -62,6 +63,8 @@ pub struct CtabCompletionProvider {
     file_sync_manager: Arc<FileSyncManager>,
     /// Smart context engine for intelligent context collection
     smart_context: SmartContextEngine,
+    /// Diagnostics tracker for error/warning collection
+    diagnostics_tracker: DiagnosticsTracker,
     buffer_id: Option<EntityId>,
     file_extension: Option<String>,
     current_file_path: Option<String>,
@@ -74,11 +77,16 @@ pub struct CtabCompletionProvider {
     filesync_cookie: String,
     /// Whether to skip the next refresh request (used when completion indicates no retrigger)
     skip_next_refresh: bool,
+    /// Whether the next refresh should update followup session version instead of invalidating
+    /// This is set when an edit was just accepted and we expect the buffer to have changed
+    followup_version_update_pending: bool,
     /// Followup edits queue for multidiff support
     followup_session: Option<FollowupSession>,
     /// Model info from server (fused cursor prediction, multidiff support)
     is_fused_cursor_prediction_model: bool,
     is_multidiff_model: bool,
+    /// Request state manager for debouncing, caching, and next action handling
+    request_state: Arc<RequestStateManager>,
 }
 
 struct CompletionState {
@@ -100,8 +108,10 @@ struct CompletionState {
     /// Cursor prediction target from server response
     cursor_prediction: Option<CursorPredictionTarget>,
     /// Whether this is from a fused cursor prediction model
+    #[allow(dead_code)]
     is_fused_model: bool,
     /// Whether the model supports multidiff
+    #[allow(dead_code)]
     is_multidiff_model: bool,
     /// Preloaded jump target for cross-file cursor prediction
     /// Contains (snapshot, target_anchor) if prediction targets a different file
@@ -131,17 +141,21 @@ struct EditPart {
     /// Binding ID for this edit
     binding_id: Option<String>,
     /// Whether to trim leading EOL
+    #[allow(dead_code)]
     should_trim_leading: bool,
 }
 
 /// Followup session for multidiff edits
 struct FollowupSession {
     /// Document path
+    #[allow(dead_code)]
     document_path: String,
     /// Queued edits
     queue: Vec<EditPart>,
     /// Buffer version when followups were cached
     buffer_version: clock::Global,
+    /// Cursor prediction to apply after all edits are done
+    cursor_prediction: Option<CursorPredictionTarget>,
 }
 
 /// Parsed result from multidiff streaming response
@@ -167,6 +181,7 @@ impl CtabCompletionProvider {
             config_cache: Arc::new(Mutex::new(None)),
             file_sync_manager: Arc::new(FileSyncManager::new(http_client, workspace_id.clone())),
             smart_context: SmartContextEngine::new(project),
+            diagnostics_tracker: DiagnosticsTracker::new(),
             buffer_id: None,
             file_extension: None,
             current_file_path: None,
@@ -176,10 +191,51 @@ impl CtabCompletionProvider {
             filesync_client_key: generate_filesync_client_key(),
             filesync_cookie: generate_filesync_cookie(),
             skip_next_refresh: false,
+            followup_version_update_pending: false,
             followup_session: None,
             is_fused_cursor_prediction_model: true, // Default to true (most models now support this)
             is_multidiff_model: true,               // Default to true
+            request_state: Arc::new(RequestStateManager::new()),
         }
+    }
+
+    /// Get the request state manager (for external access if needed)
+    pub fn request_state(&self) -> &Arc<RequestStateManager> {
+        &self.request_state
+    }
+
+    /// Check if we should trigger a completion based on trigger manager state
+    pub fn should_trigger(&self, source: TriggerSource) -> bool {
+        let file_path = self.current_file_path.as_deref().unwrap_or("unknown");
+        self.request_state.trigger.should_trigger(file_path, source)
+    }
+
+    /// Record a rejection for cooldown purposes
+    pub fn record_rejection(&self) {
+        self.request_state.trigger.record_rejection();
+    }
+
+    /// Check if there are cached suggestions available
+    pub fn has_cached_suggestion(&self) -> bool {
+        if self.current_file_path.is_some() {
+            // We can't check version without buffer, so just check if cache is non-empty
+            !self.request_state.cache.is_empty()
+        } else {
+            false
+        }
+    }
+
+    /// Get the number of pending followup edits
+    pub fn followup_count(&self) -> usize {
+        self.followup_session
+            .as_ref()
+            .map(|s| s.queue.len())
+            .unwrap_or(0)
+    }
+
+    /// Check if there's a next action registered
+    pub fn has_next_action(&self, action_id: &str) -> bool {
+        self.request_state.next_action.peek(action_id).is_some()
     }
 
     /// Update workspace_id based on actual workspace path for stability
@@ -192,7 +248,7 @@ impl CtabCompletionProvider {
                 let stable_id = generate_stable_workspace_id(&root_path);
                 if self.workspace_id != stable_id {
                     log::info!(
-                        "Cometix: Updating workspace_id from {} to {} (path: {})",
+                        "Ctab: Updating workspace_id from {} to {} (path: {})",
                         self.workspace_id,
                         stable_id,
                         root_path
@@ -263,6 +319,7 @@ impl CtabCompletionProvider {
     /// The API uses gRPC-Web protocol with Length-Prefixed Messages (LPM):
     /// - Each message has a 5-byte header: 1 byte flag + 4 bytes big-endian length
     /// - Messages are streamed until `done_stream` flag is set
+    #[allow(dead_code)]
     async fn fetch_completion(
         http_client: Arc<dyn HttpClient>,
         request: StreamCppRequest,
@@ -277,13 +334,10 @@ impl CtabCompletionProvider {
     ) -> Result<StreamCppResponse> {
         let url = format!("{}{}", base_url, stream_path);
 
-        log::info!("Cometix: Sending request to {}", url);
+        log::info!("Ctab: Sending request to {}", url);
 
         let proto_body = request.encode_to_vec();
-        log::info!(
-            "Cometix: Request proto body size: {} bytes",
-            proto_body.len()
-        );
+        log::info!("Ctab: Request proto body size: {} bytes", proto_body.len());
 
         // Connect RPC requires envelope format: [flags(1)][length(4)][payload]
         // flags: 0 = uncompressed
@@ -293,7 +347,7 @@ impl CtabCompletionProvider {
             envelope.extend_from_slice(&(proto_body.len() as u32).to_be_bytes()); // length
             envelope.extend_from_slice(&proto_body); // payload
             log::info!(
-                "Cometix: Wrapped in Connect envelope, total size: {} bytes",
+                "Ctab: Wrapped in Connect envelope, total size: {} bytes",
                 envelope.len()
             );
             envelope
@@ -323,7 +377,7 @@ impl CtabCompletionProvider {
             .body(AsyncBody::from(body))?;
 
         log::debug!(
-            "Cometix: Request headers - Content-Type: {}, {}: {}",
+            "Ctab: Request headers - Content-Type: {}, {}: {}",
             content_type,
             client_key_header,
             &client_key[..client_key.len().min(20)]
@@ -332,12 +386,12 @@ impl CtabCompletionProvider {
         let mut response = http_client.send(http_request).await?;
         let status = response.status();
 
-        log::info!("Cometix: Response status: {}", status);
+        log::info!("Ctab: Response status: {}", status);
 
         // Handle 204 No Content - server has no suggestion
         if status.as_u16() == 204 {
             log::info!(
-                "Cometix: Server returned 204 No Content - no completion suggestion available. \
+                "Ctab: Server returned 204 No Content - no completion suggestion available. \
                 This is normal when: (1) input is too short, (2) cursor position doesn't need completion, \
                 (3) server is rate limiting, or (4) model decided no suggestion is appropriate."
             );
@@ -348,12 +402,12 @@ impl CtabCompletionProvider {
         let mut body_bytes = Vec::new();
         response.body_mut().read_to_end(&mut body_bytes).await?;
 
-        log::debug!("Cometix: Response body size: {} bytes", body_bytes.len());
+        log::debug!("Ctab: Response body size: {} bytes", body_bytes.len());
 
         if !status.is_success() {
             let error_text = String::from_utf8_lossy(&body_bytes);
             log::error!(
-                "Cometix: Request failed with status {}: {}",
+                "Ctab: Request failed with status {}: {}",
                 status,
                 error_text
             );
@@ -364,19 +418,19 @@ impl CtabCompletionProvider {
         if !body_bytes.is_empty() {
             let preview_len = body_bytes.len().min(200);
             log::info!(
-                "Cometix: Response body size={}, preview (first {} bytes): {:?}",
+                "Ctab: Response body size={}, preview (first {} bytes): {:?}",
                 body_bytes.len(),
                 preview_len,
                 &body_bytes[..preview_len]
             );
             // Also log as text if possible
             let text_preview = String::from_utf8_lossy(&body_bytes[..preview_len]);
-            log::info!("Cometix: Response as text: {}", text_preview);
+            log::info!("Ctab: Response as text: {}", text_preview);
 
             // Check if response is JSON (starts with '{')
             if body_bytes.first() == Some(&b'{') {
                 let json_text = String::from_utf8_lossy(&body_bytes);
-                log::info!("Cometix: Response appears to be JSON: {}", json_text);
+                log::info!("Ctab: Response appears to be JSON: {}", json_text);
                 // Try to parse as JSON and extract text field
                 if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
                     let text = json.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -523,6 +577,7 @@ impl CtabCompletionProvider {
     ///
     /// Format: [1-byte flag][4-byte big-endian length][payload]...
     /// Accumulates text from all messages until `done_stream` is true.
+    #[allow(dead_code)]
     fn parse_streaming_response(body: &[u8]) -> Result<StreamCppResponse> {
         const HEADER_SIZE: usize = 5;
 
@@ -534,10 +589,7 @@ impl CtabCompletionProvider {
         let mut offset = 0;
         let mut message_count = 0;
 
-        log::info!(
-            "Cometix: Starting to parse {} bytes of response",
-            body.len()
-        );
+        log::info!("Ctab: Starting to parse {} bytes of response", body.len());
 
         while offset + HEADER_SIZE <= body.len() {
             // Parse 5-byte header: 1 byte flags + 4 bytes length
@@ -551,7 +603,7 @@ impl CtabCompletionProvider {
 
             message_count += 1;
             log::info!(
-                "Cometix: Message #{}: flags={}, length={}, offset={}",
+                "Ctab: Message #{}: flags={}, length={}, offset={}",
                 message_count,
                 flags,
                 length,
@@ -563,7 +615,7 @@ impl CtabCompletionProvider {
             // Validate we have enough bytes for the payload
             if offset + length > body.len() {
                 log::warn!(
-                    "Cometix: Incomplete message - expected {} bytes, have {}",
+                    "Ctab: Incomplete message - expected {} bytes, have {}",
                     length,
                     body.len() - offset
                 );
@@ -574,7 +626,7 @@ impl CtabCompletionProvider {
             if flags == 2 {
                 let trailer_data = &body[offset..offset + length];
                 let trailer_text = String::from_utf8_lossy(trailer_data);
-                log::info!("Cometix: End-of-stream trailer: {}", trailer_text);
+                log::info!("Ctab: End-of-stream trailer: {}", trailer_text);
                 offset += length;
                 continue;
             }
@@ -582,7 +634,7 @@ impl CtabCompletionProvider {
             // Decode the protobuf message
             let payload = &body[offset..offset + length];
             log::info!(
-                "Cometix: Payload bytes: {:?}",
+                "Ctab: Payload bytes: {:?}",
                 &payload[..payload.len().min(50)]
             );
             match StreamCppResponse::decode(payload) {
@@ -594,7 +646,7 @@ impl CtabCompletionProvider {
                         msg.text.clone()
                     };
                     log::info!(
-                        "Cometix: Decoded message - text='{}', done_stream={:?}, binding_id={:?}",
+                        "Ctab: Decoded message - text='{}', done_stream={:?}, binding_id={:?}",
                         truncated_text,
                         msg.done_stream,
                         msg.binding_id
@@ -625,12 +677,12 @@ impl CtabCompletionProvider {
 
                     // Check for stream termination
                     if msg.done_stream.unwrap_or(false) {
-                        log::info!("Cometix: Stream completed with done_stream flag");
+                        log::info!("Ctab: Stream completed with done_stream flag");
                         break;
                     }
                 }
                 Err(e) => {
-                    log::warn!("Cometix: Failed to decode stream message: {}", e);
+                    log::warn!("Ctab: Failed to decode stream message: {}", e);
                     // Continue to next message - partial failures are acceptable
                 }
             }
@@ -741,7 +793,19 @@ impl CtabCompletionProvider {
             let payload = &body[offset..offset + length];
             match StreamCppResponse::decode(payload) {
                 Ok(msg) => {
-                    // Handle begin_edit: signals start of a new edit
+                    // Debug: log message contents
+                    log::info!(
+                        "Ctab: [Multidiff] Message #{}: text_len={}, has_range={}, begin_edit={:?}, done_edit={:?}, done_stream={:?}, has_model_info={}",
+                        message_count,
+                        msg.text.len(),
+                        msg.range_to_replace.is_some(),
+                        msg.begin_edit,
+                        msg.done_edit,
+                        msg.done_stream,
+                        msg.model_info.is_some()
+                    );
+
+                    // Handle begin_edit: signals start of a new edit (multidiff protocol)
                     if msg.begin_edit.unwrap_or(false) {
                         log::info!(
                             "Ctab: [Multidiff] begin_edit received (edit #{})",
@@ -757,6 +821,15 @@ impl CtabCompletionProvider {
                                 &mut current_should_trim_leading,
                             );
                         }
+                        in_edit = true;
+                    }
+
+                    // Legacy mode: if we have text + range but no begin_edit, treat as implicit edit
+                    // This handles servers that don't use the multidiff protocol
+                    let has_content = !msg.text.is_empty() || msg.range_to_replace.is_some();
+                    let is_legacy_mode = has_content && !in_edit && msg.begin_edit.is_none();
+                    if is_legacy_mode {
+                        log::info!("Ctab: [Multidiff] Legacy mode detected - implicit edit start");
                         in_edit = true;
                     }
 
@@ -805,7 +878,7 @@ impl CtabCompletionProvider {
                         });
                     }
 
-                    // Handle done_edit: signals end of current edit
+                    // Handle done_edit: signals end of current edit (multidiff protocol)
                     if msg.done_edit.unwrap_or(false) {
                         log::info!("Ctab: [Multidiff] done_edit received");
                         flush_edit(
@@ -821,6 +894,20 @@ impl CtabCompletionProvider {
                     // Check for stream termination
                     if msg.done_stream.unwrap_or(false) {
                         log::info!("Ctab: [Multidiff] Stream completed");
+                        // In legacy mode, done_stream also signals end of edit
+                        if in_edit && msg.done_edit.is_none() {
+                            log::info!(
+                                "Ctab: [Multidiff] Legacy mode - flushing edit on done_stream"
+                            );
+                            flush_edit(
+                                &mut edits,
+                                &mut current_text,
+                                &mut current_range,
+                                &mut current_binding_id,
+                                &mut current_should_trim_leading,
+                            );
+                            in_edit = false;
+                        }
                         break;
                     }
                 }
@@ -896,12 +983,9 @@ impl CtabCompletionProvider {
         let response = http_client.send(http_request).await?;
 
         if response.status().is_success() {
-            log::debug!("Cometix: Successfully recorded fate {:?}", fate);
+            log::debug!("Ctab: Successfully recorded fate {:?}", fate);
         } else {
-            log::warn!(
-                "Cometix: Failed to record fate, status: {}",
-                response.status()
-            );
+            log::warn!("Ctab: Failed to record fate, status: {}", response.status());
         }
 
         Ok(())
@@ -940,7 +1024,7 @@ impl CtabCompletionProvider {
             )
             .await
             {
-                log::error!("Cometix: Failed to record fate: {}", e);
+                log::error!("Ctab: Failed to record fate: {}", e);
             }
         })
         .detach();
@@ -962,7 +1046,7 @@ impl CtabCompletionProvider {
         let url = format!("{}{}", base_url, append_path);
 
         log::debug!(
-            "Cometix: Sending CppAppend request to {}, changes size: {} bytes",
+            "Ctab: Sending CppAppend request to {}, changes size: {} bytes",
             url,
             changes.len()
         );
@@ -987,14 +1071,14 @@ impl CtabCompletionProvider {
             response.body_mut().read_to_end(&mut body_bytes).await?;
             let error_text = String::from_utf8_lossy(&body_bytes);
             log::warn!(
-                "Cometix: CppAppend failed with status {}: {}",
+                "Ctab: CppAppend failed with status {}: {}",
                 status,
                 error_text
             );
             return Ok(false);
         }
 
-        log::debug!("Cometix: CppAppend completed successfully");
+        log::debug!("Ctab: CppAppend completed successfully");
         Ok(true)
     }
 
@@ -1005,7 +1089,7 @@ impl CtabCompletionProvider {
         let settings = CtabSettings::get_global(cx);
 
         let Some(auth_token) = settings.auth_token.clone() else {
-            log::debug!("Cometix: Skipping CppAppend - no auth token");
+            log::debug!("Ctab: Skipping CppAppend - no auth token");
             return;
         };
 
@@ -1021,7 +1105,7 @@ impl CtabCompletionProvider {
         let http_client = self.http_client.clone();
 
         log::debug!(
-            "Cometix: Triggering CppAppend with {} bytes of changes",
+            "Ctab: Triggering CppAppend with {} bytes of changes",
             changes.len()
         );
 
@@ -1038,7 +1122,7 @@ impl CtabCompletionProvider {
             )
             .await
             {
-                log::error!("Cometix: Failed to send CppAppend: {}", e);
+                log::error!("Ctab: Failed to send CppAppend: {}", e);
             }
         })
         .detach();
@@ -1072,7 +1156,7 @@ impl CtabCompletionProvider {
     ) -> Result<CppConfigResponse> {
         let url = format!("{}{}", base_url, config_path);
 
-        log::debug!("Cometix: Fetching CppConfig from {}", url);
+        log::debug!("Ctab: Fetching CppConfig from {}", url);
 
         let request = CppConfigRequest {
             is_nightly: Some(false),
@@ -1098,7 +1182,7 @@ impl CtabCompletionProvider {
         response.body_mut().read_to_end(&mut body_bytes).await?;
 
         log::debug!(
-            "Cometix: CppConfig response - status={}, body_len={}, body_preview={:?}",
+            "Ctab: CppConfig response - status={}, body_len={}, body_preview={:?}",
             status,
             body_bytes.len(),
             String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(200)])
@@ -1107,7 +1191,7 @@ impl CtabCompletionProvider {
         if !status.is_success() {
             let error_text = String::from_utf8_lossy(&body_bytes);
             log::warn!(
-                "Cometix: CppConfig request failed with status {}: {}",
+                "Ctab: CppConfig request failed with status {}: {}",
                 status,
                 error_text
             );
@@ -1116,7 +1200,7 @@ impl CtabCompletionProvider {
 
         // Handle empty response gracefully
         if body_bytes.is_empty() {
-            log::warn!("Cometix: CppConfig returned empty response, using defaults");
+            log::warn!("Ctab: CppConfig returned empty response, using defaults");
             return Ok(CppConfigResponse::default());
         }
 
@@ -1124,7 +1208,7 @@ impl CtabCompletionProvider {
             Ok(c) => c,
             Err(e) => {
                 log::warn!(
-                    "Cometix: CppConfig decode failed ({}), raw bytes: {:?}",
+                    "Ctab: CppConfig decode failed ({}), raw bytes: {:?}",
                     e,
                     &body_bytes[..body_bytes.len().min(50)]
                 );
@@ -1133,7 +1217,7 @@ impl CtabCompletionProvider {
             }
         };
         log::info!(
-            "Cometix: Received CppConfig - is_on={:?}, debounce={}ms, geo_url={:?}",
+            "Ctab: Received CppConfig - is_on={:?}, debounce={}ms, geo_url={:?}",
             config.is_on,
             config.client_debounce_duration_millis,
             config.geo_cpp_backend_url
@@ -1142,7 +1226,7 @@ impl CtabCompletionProvider {
         // Phase 3: Log enhanced config fields if present
         if config.allows_tab_chunks || config.tab_context_refresh_debounce_ms.is_some() {
             log::info!(
-                "Cometix: Enhanced config - allows_tab_chunks={}, tab_refresh_debounce_ms={:?}, editor_change_debounce_ms={:?}",
+                "Ctab: Enhanced config - allows_tab_chunks={}, tab_refresh_debounce_ms={:?}, editor_change_debounce_ms={:?}",
                 config.allows_tab_chunks,
                 config.tab_context_refresh_debounce_ms,
                 config.tab_context_refresh_editor_change_debounce_ms
@@ -1220,10 +1304,10 @@ impl CtabCompletionProvider {
                         config,
                         fetched_at: std::time::Instant::now(),
                     });
-                    log::debug!("Cometix: Config cache updated");
+                    log::debug!("Ctab: Config cache updated");
                 }
                 Err(e) => {
-                    log::error!("Cometix: Failed to fetch CppConfig: {}", e);
+                    log::error!("Ctab: Failed to fetch CppConfig: {}", e);
                 }
             }
         })
@@ -1249,7 +1333,7 @@ impl CtabCompletionProvider {
         file_path: &str,
     ) -> Option<CppContextItem> {
         log::info!(
-            "Cometix: get_enclosing_context called - offset={}, file={}",
+            "Ctab: get_enclosing_context called - offset={}, file={}",
             cursor_offset,
             file_path
         );
@@ -1259,13 +1343,13 @@ impl CtabCompletionProvider {
         let symbols = snapshot.symbols_containing(cursor_offset, None);
 
         log::info!(
-            "Cometix: symbols_containing returned {} symbols",
+            "Ctab: symbols_containing returned {} symbols",
             symbols.len()
         );
 
         if symbols.is_empty() {
             log::info!(
-                "Cometix: No enclosing symbols found at offset {}",
+                "Ctab: No enclosing symbols found at offset {}",
                 cursor_offset
             );
             return None;
@@ -1281,14 +1365,14 @@ impl CtabCompletionProvider {
         // Skip if the scope is too large (> 10KB) to avoid overwhelming the context
         if contents.len() > 10 * 1024 {
             log::debug!(
-                "Cometix: Enclosing scope too large ({} bytes), skipping",
+                "Ctab: Enclosing scope too large ({} bytes), skipping",
                 contents.len()
             );
             return None;
         }
 
         log::info!(
-            "Cometix: Found enclosing scope '{}' ({} bytes)",
+            "Ctab: Found enclosing scope '{}' ({} bytes)",
             innermost.text,
             contents.len()
         );
@@ -1307,14 +1391,6 @@ impl CtabCompletionProvider {
             .as_ref()
             .map(|s| !s.queue.is_empty())
             .unwrap_or(false)
-    }
-
-    /// Get the number of remaining followup edits
-    pub fn followup_count(&self) -> usize {
-        self.followup_session
-            .as_ref()
-            .map(|s| s.queue.len())
-            .unwrap_or(0)
     }
 
     /// Get cursor prediction target if available
@@ -1456,6 +1532,67 @@ impl EditPredictionProvider for CtabCompletionProvider {
             return;
         }
 
+        // Get file path early for cache/debounce checks
+        let snapshot_for_path = buffer.read(cx).snapshot();
+        let file_path_for_cache = snapshot_for_path
+            .file()
+            .map(|f| f.path().as_unix_str().to_string())
+            .unwrap_or_else(|| "untitled".to_string());
+        // Use a simple counter based on buffer text length as cache key heuristic
+        // This is a lightweight approximation - exact version tracking would require clock::Global comparison
+        let buffer_version_for_cache = buffer.read(cx).text().len();
+
+        // PRIORITY 0: Check suggestion cache for superseded request results
+        if let Some(cached) = self
+            .request_state
+            .cache
+            .pop(&file_path_for_cache, buffer_version_for_cache)
+        {
+            log::info!(
+                "Ctab: Using cached suggestion from superseded request {}",
+                &cached.request_id[..16.min(cached.request_id.len())]
+            );
+
+            // Pre-compute edits for the cached suggestion
+            let buffer_ref = buffer.read(cx);
+            let buffer_snapshot = buffer_ref.snapshot();
+            let cursor_offset = cursor_position.to_offset(&buffer_snapshot);
+            let cursor_point = buffer_snapshot.offset_to_point(cursor_offset);
+
+            let snapshot_differ = SnapshotDiffer::new();
+            let diff_result = snapshot_differ.extract_inline_edits(
+                &buffer_snapshot,
+                cursor_offset,
+                cursor_point,
+                &cached.text,
+                cached.api_range,
+            );
+
+            let precomputed_edits = if diff_result.edits.is_empty() {
+                None
+            } else {
+                Some(diff_result.edits)
+            };
+
+            self.current_completion = Some(CompletionState {
+                text: cached.text,
+                binding_id: cached.binding_id,
+                range_start: cursor_position,
+                range_end: cursor_position,
+                api_range: cached.api_range,
+                should_retrigger: cached.should_retrigger,
+                precomputed_edits,
+                original_snapshot: Some(buffer_snapshot),
+                cursor_prediction: None,
+                is_fused_model: self.is_fused_cursor_prediction_model,
+                is_multidiff_model: self.is_multidiff_model,
+                jump_target: None,
+            });
+
+            cx.notify();
+            return;
+        }
+
         // PRIORITY 1: Check for cached followup edits from previous multidiff stream
         // Followup edits take priority because they are the "next edit" the user expects
         if let Some(ref mut session) = self.followup_session {
@@ -1464,62 +1601,174 @@ impl EditPredictionProvider for CtabCompletionProvider {
                 let current_version = buffer_ref.version();
 
                 // Check if buffer version has changed since followups were cached
-                // If the version has changed, invalidate followups to avoid stale edits
+                // If the version has changed, check if it's an expected change (from accepting previous edit)
                 if current_version.changed_since(&session.buffer_version) {
-                    // Buffer has changed, invalidate followups
-                    log::info!("Ctab: [Multidiff] Clearing stale followup cache (buffer changed)");
-                    self.followup_session = None;
-                } else {
-                    // Use next followup edit
-                    let next_edit = session.queue.remove(0);
-                    log::info!(
-                        "Ctab: [Multidiff] Using cached followup edit ({} remaining)",
-                        session.queue.len()
-                    );
-
-                    // Pre-compute edits for the followup
-                    let buffer_snapshot = buffer_ref.snapshot();
-                    let cursor_offset = cursor_position.to_offset(&buffer_snapshot);
-                    let cursor_point = buffer_snapshot.offset_to_point(cursor_offset);
-
-                    let snapshot_differ = SnapshotDiffer::new();
-                    let diff_result = snapshot_differ.extract_inline_edits(
-                        &buffer_snapshot,
-                        cursor_offset,
-                        cursor_point,
-                        &next_edit.text,
-                        Some(next_edit.range),
-                    );
-
-                    let precomputed_edits = if diff_result.edits.is_empty() {
-                        None
+                    if self.followup_version_update_pending {
+                        // Expected change from accepting an edit - update version and continue
+                        log::info!(
+                            "Ctab: [Multidiff] Updating followup session version after accept"
+                        );
+                        session.buffer_version = current_version.clone();
+                        self.followup_version_update_pending = false;
                     } else {
-                        Some(diff_result.edits)
-                    };
+                        // Unexpected buffer change - invalidate followups to avoid stale edits
+                        log::info!(
+                            "Ctab: [Multidiff] Clearing stale followup cache (buffer changed)"
+                        );
+                        self.followup_session = None;
+                        self.followup_version_update_pending = false;
+                    }
+                }
+            }
+        }
 
-                    // Store the followup as current completion
+        // Re-check followup session after potential version update
+        if let Some(ref mut session) = self.followup_session {
+            if !session.queue.is_empty() {
+                let buffer_ref = buffer.read(cx);
+
+                // Use next followup edit
+                let next_edit = session.queue.remove(0);
+                let remaining_edits = session.queue.len();
+                let has_cursor_prediction = session.cursor_prediction.is_some();
+
+                log::info!(
+                    "Ctab: [Multidiff] Using cached followup edit ({} remaining, has_cursor_prediction={})",
+                    remaining_edits,
+                    has_cursor_prediction
+                );
+
+                // Pre-compute edits for the followup
+                let buffer_snapshot = buffer_ref.snapshot();
+                let cursor_offset = cursor_position.to_offset(&buffer_snapshot);
+                let cursor_point = buffer_snapshot.offset_to_point(cursor_offset);
+
+                let snapshot_differ = SnapshotDiffer::new();
+                let diff_result = snapshot_differ.extract_inline_edits(
+                    &buffer_snapshot,
+                    cursor_offset,
+                    cursor_point,
+                    &next_edit.text,
+                    Some(next_edit.range),
+                );
+
+                let precomputed_edits = if diff_result.edits.is_empty() {
+                    None
+                } else {
+                    Some(diff_result.edits)
+                };
+
+                // Retrigger if more followups OR if we have a cursor prediction after this edit
+                let should_retrigger = remaining_edits > 0 || has_cursor_prediction;
+
+                // Store the followup as current completion
+                self.current_completion = Some(CompletionState {
+                    text: next_edit.text,
+                    binding_id: next_edit.binding_id,
+                    range_start: cursor_position,
+                    range_end: cursor_position,
+                    api_range: Some(next_edit.range),
+                    should_retrigger,
+                    precomputed_edits,
+                    original_snapshot: Some(buffer_snapshot),
+                    cursor_prediction: None, // Cursor prediction handled separately below
+                    is_fused_model: self.is_fused_cursor_prediction_model,
+                    is_multidiff_model: self.is_multidiff_model,
+                    jump_target: None, // Jump target set when it's time to jump
+                });
+
+                // Clear session if no more followups (but keep cursor_prediction for next step)
+                if remaining_edits == 0 {
+                    // Take cursor_prediction before clearing session
+                    let final_cursor_prediction = session.cursor_prediction.take();
+                    self.followup_session = None;
+
+                    // If we have a cursor prediction, prepare for the final jump
+                    if let Some(prediction) = final_cursor_prediction {
+                        log::info!(
+                            "Ctab: [Multidiff] All edits done, cursor prediction pending: {}:{}",
+                            prediction.relative_path,
+                            prediction.line_number_one_indexed
+                        );
+                        // Store the cursor prediction for the next refresh cycle
+                        // We'll create a jump-only completion in the next refresh
+                        self.followup_session = Some(FollowupSession {
+                            document_path: self.current_file_path.clone().unwrap_or_default(),
+                            queue: vec![], // Empty queue signals jump-only mode
+                            buffer_version: buffer.read(cx).version(),
+                            cursor_prediction: Some(prediction),
+                        });
+                    }
+                }
+
+                cx.notify();
+                return;
+            } else if session.cursor_prediction.is_some() {
+                // Queue is empty but we have a cursor prediction - create jump-only completion
+                let prediction = session.cursor_prediction.take().unwrap();
+                let buffer_ref = buffer.read(cx);
+                let buffer_snapshot = buffer_ref.snapshot();
+
+                log::info!(
+                    "Ctab: [Multidiff] Creating jump-only completion for cursor prediction: {}:{}",
+                    prediction.relative_path,
+                    prediction.line_number_one_indexed
+                );
+
+                // Create jump target
+                let current_file = self.current_file_path.clone().unwrap_or_default();
+                let is_same_file =
+                    prediction.relative_path == current_file || prediction.relative_path.is_empty();
+
+                let jump_target = if is_same_file {
+                    // Same-file jump
+                    let line = (prediction.line_number_one_indexed - 1).max(0) as u32;
+                    let point = Point::new(line, 0);
+                    let clamped_point = buffer_snapshot.clip_point(point, language::Bias::Left);
+                    let target_anchor = buffer_snapshot.anchor_before(clamped_point);
+                    Some((buffer_snapshot.clone(), target_anchor))
+                } else {
+                    // Cross-file jump - try to preload target buffer
+                    if let Some(ref project) = self.project {
+                        Self::try_preload_jump_target(
+                            project,
+                            &prediction.relative_path,
+                            prediction.line_number_one_indexed,
+                            cx,
+                        )
+                    } else {
+                        None
+                    }
+                };
+
+                // Clear followup session
+                self.followup_session = None;
+
+                if jump_target.is_some() {
+                    // Create jump-only completion (no edits, just jump)
                     self.current_completion = Some(CompletionState {
-                        text: next_edit.text,
-                        binding_id: next_edit.binding_id,
+                        text: String::new(),
+                        binding_id: None,
                         range_start: cursor_position,
                         range_end: cursor_position,
-                        api_range: Some(next_edit.range),
-                        should_retrigger: !session.queue.is_empty(), // Retrigger if more followups
-                        precomputed_edits,
+                        api_range: None,
+                        should_retrigger: prediction.should_retrigger_cpp,
+                        precomputed_edits: None, // No edits, just jump
                         original_snapshot: Some(buffer_snapshot),
-                        cursor_prediction: None, // Followups don't have cursor prediction
+                        cursor_prediction: Some(prediction),
                         is_fused_model: self.is_fused_cursor_prediction_model,
                         is_multidiff_model: self.is_multidiff_model,
-                        jump_target: None, // Followups are always in the same file
+                        jump_target,
                     });
-
-                    // Clear session if no more followups
-                    if session.queue.is_empty() {
-                        self.followup_session = None;
-                    }
 
                     cx.notify();
                     return;
+                } else {
+                    log::warn!(
+                        "Ctab: [Multidiff] Failed to create jump target for {}:{}",
+                        prediction.relative_path,
+                        prediction.line_number_one_indexed
+                    );
                 }
             }
         }
@@ -1531,12 +1780,12 @@ impl EditPredictionProvider for CtabCompletionProvider {
 
         // Check if enabled and has auth token
         if !settings.enabled {
-            log::debug!("Cometix: Disabled in settings");
+            log::debug!("Ctab: Disabled in settings");
             return;
         }
 
         let Some(auth_token) = settings.auth_token.clone() else {
-            log::warn!("Cometix: No auth token configured");
+            log::warn!("Ctab: No auth token configured");
             return;
         };
 
@@ -1555,7 +1804,7 @@ impl EditPredictionProvider for CtabCompletionProvider {
         let fs_upload_path = settings.fs_upload_path();
 
         // Release immutable borrow before using cx mutably again
-        drop(settings);
+        let _ = settings;
 
         // Use server config debounce if available, otherwise use local setting
         let server_config = self.get_or_refresh_config(cx);
@@ -1566,7 +1815,7 @@ impl EditPredictionProvider for CtabCompletionProvider {
             .unwrap_or(default_debounce_ms);
 
         log::info!(
-            "Cometix: Using endpoint_type={:?}, base_url={}, stream_path={}, uses_connect_rpc={}, has_auth_token={}",
+            "Ctab: Using endpoint_type={:?}, base_url={}, stream_path={}, uses_connect_rpc={}, has_auth_token={}",
             endpoint_type,
             base_url,
             stream_path,
@@ -1667,7 +1916,7 @@ impl EditPredictionProvider for CtabCompletionProvider {
             let upload_sync_manager = file_sync_manager.clone();
 
             cx.spawn(async move |_, _| {
-                log::info!("Cometix: Uploading file {} for sync", upload_file_path);
+                log::info!("Ctab: Uploading file {} for sync", upload_file_path);
                 match FileSyncManager::upload_file(
                     upload_http_client,
                     upload_uuid,
@@ -1685,18 +1934,18 @@ impl EditPredictionProvider for CtabCompletionProvider {
                 .await
                 {
                     Ok(FsUploadErrorType::Unspecified) => {
-                        log::info!("Cometix: File {} uploaded successfully", upload_file_path);
+                        log::info!("Ctab: File {} uploaded successfully", upload_file_path);
                         upload_sync_manager.mark_uploaded(&upload_file_path, upload_hash);
                     }
                     Ok(error) => {
                         log::warn!(
-                            "Cometix: File {} upload returned error: {:?}",
+                            "Ctab: File {} upload returned error: {:?}",
                             upload_file_path,
                             error
                         );
                     }
                     Err(e) => {
-                        log::error!("Cometix: Failed to upload file {}: {}", upload_file_path, e);
+                        log::error!("Ctab: Failed to upload file {}: {}", upload_file_path, e);
                     }
                 }
             })
@@ -1724,7 +1973,7 @@ impl EditPredictionProvider for CtabCompletionProvider {
         let rely_on_filesync = false;
 
         log::info!(
-            "Cometix: File sync status - needs_upload={}, rely_on_filesync={}, pending_updates={}",
+            "Ctab: File sync status - needs_upload={}, rely_on_filesync={}, pending_updates={}",
             needs_upload,
             rely_on_filesync,
             filesync_updates.len()
@@ -1742,90 +1991,37 @@ impl EditPredictionProvider for CtabCompletionProvider {
             );
         }
 
-        // Phase 1: Collect diagnostics from buffer
-        // Only collect Error and Warning severity, limit to 20 entries to save tokens
-        let diagnostics: Vec<ProtoDiagnostic> = snapshot
-            .diagnostics_in_range::<_, Point>(0..snapshot.len(), false)
-            .filter(|entry| {
-                matches!(
-                    entry.diagnostic.severity,
-                    DiagnosticSeverity::ERROR | DiagnosticSeverity::WARNING
-                )
-            })
-            .take(20)
-            .map(|entry| {
-                let severity = match entry.diagnostic.severity {
-                    DiagnosticSeverity::ERROR => ProtoDiagnosticSeverity::Error,
-                    DiagnosticSeverity::WARNING => ProtoDiagnosticSeverity::Warning,
-                    DiagnosticSeverity::INFORMATION => ProtoDiagnosticSeverity::Information,
-                    DiagnosticSeverity::HINT => ProtoDiagnosticSeverity::Hint,
-                    _ => ProtoDiagnosticSeverity::Unspecified,
-                };
+        // Phase 1: Collect diagnostics using DiagnosticsTracker
+        let diag_result = self.diagnostics_tracker.collect(
+            &snapshot, &file_path, point,
+            false, // Don't include content in linter_errors (already in CurrentFileInfo)
+        );
 
-                ProtoDiagnostic {
-                    message: entry.diagnostic.message.clone(),
-                    range: Some(CursorRange {
-                        start_position: Some(CursorPosition {
-                            line: entry.range.start.row as i32,
-                            column: entry.range.start.column as i32,
-                        }),
-                        end_position: Some(CursorPosition {
-                            line: entry.range.end.row as i32,
-                            column: entry.range.end.column as i32,
-                        }),
-                    }),
-                    severity: severity.into(),
-                    related_information: vec![],
-                }
-            })
-            .collect();
-
-        if !diagnostics.is_empty() {
+        if diag_result.error_count > 0 || diag_result.warning_count > 0 {
             log::info!(
-                "Cometix: Collected {} diagnostics for {}",
-                diagnostics.len(),
+                "Ctab: Collected {} diagnostics ({} errors, {} warnings) for {}",
+                diag_result.diagnostics.len(),
+                diag_result.error_count,
+                diag_result.warning_count,
                 file_path
             );
-            // Log each diagnostic detail for debugging
-            for (i, diag) in diagnostics.iter().enumerate() {
-                if let Some(ref range) = diag.range {
-                    let start = range
-                        .start_position
-                        .as_ref()
-                        .map(|p| format!("{}:{}", p.line, p.column))
-                        .unwrap_or_default();
-                    let end = range
-                        .end_position
-                        .as_ref()
-                        .map(|p| format!("{}:{}", p.line, p.column))
-                        .unwrap_or_default();
-                    log::info!(
-                        "Cometix: Diagnostic[{}]: severity={:?}, range={}..{}, message='{}'",
-                        i,
-                        diag.severity,
-                        start,
-                        end,
-                        diag.message
-                    );
-                }
-            }
         }
 
         // Build the request
         log::info!(
-            "Cometix: Building request - file={}, cursor=({},{}), content_len={}, language={}, diagnostics={}",
+            "Ctab: Building request - file={}, cursor=({},{}), content_len={}, language={}, diagnostics={}",
             file_path,
             point.row,
             point.column,
             content.len(),
             Self::detect_language(&file_path),
-            diagnostics.len()
+            diag_result.diagnostics.len()
         );
 
         // Log content preview for debugging
         let content_preview: String = content.chars().take(200).collect();
         log::info!(
-            "Cometix: Content preview: {}",
+            "Ctab: Content preview: {}",
             content_preview.replace('\n', "\\n")
         );
 
@@ -1857,13 +2053,13 @@ impl EditPredictionProvider for CtabCompletionProvider {
                 workspace_root_path: String::new(),
                 line_ending: Some("\n".to_string()),
                 // Phase 1: Include diagnostics for AI-assisted error fixing
-                diagnostics,
+                diagnostics: diag_result.diagnostics,
             }),
             // Note: diff_history field is deprecated, use file_diff_histories instead
             diff_history: vec![],
             model_name: Some(model_name),
-            // New fields from unite.proto
-            linter_errors: None, // TODO: Convert diagnostics to LinterErrors format
+            // New fields from unite.proto - now using DiagnosticsTracker for linter_errors
+            linter_errors: diag_result.linter_errors,
             diff_history_keys: vec![],
             give_debug_output: None,
             // Build proper CppFileDiffHistory structure with complete history
@@ -1929,9 +2125,41 @@ impl EditPredictionProvider for CtabCompletionProvider {
         // Capture file path for followup session
         let current_file_path = file_path.clone();
 
+        // Use debounce manager for request control
+        let request_state = self.request_state.clone();
+        let run_result = request_state.debounce.run_request(file_path.clone());
+        let request_id = run_result.request_id.clone();
+
+        // Set this as the current request for the document
+        request_state.set_current_request(&file_path, &request_id);
+
+        // Update debounce delay from server config
+        request_state.debounce.set_debounce_ms(debounce_ms);
+
+        // Log cancelled requests
+        if !run_result.requests_to_cancel.is_empty() {
+            log::debug!(
+                "Ctab: Cancelled {} old requests due to concurrency limit",
+                run_result.requests_to_cancel.len()
+            );
+        }
+
+        // Capture buffer text length as version proxy for cache
+        let buffer_version = buffer.read(cx).text().len();
+
         self.pending_refresh = Some(cx.spawn(async move |this, cx| {
+            // Debounce: wait before proceeding
             if debounce {
                 gpui::Timer::after(Duration::from_millis(debounce_ms)).await;
+            }
+
+            // Check if request was cancelled during debounce wait
+            if request_state.debounce.is_cancelled(&request_id) {
+                log::debug!(
+                    "Ctab: Request {} cancelled during debounce",
+                    &request_id[..16.min(request_id.len())]
+                );
+                return Ok(());
             }
 
             // Use multidiff-aware fetch
@@ -1952,6 +2180,9 @@ impl EditPredictionProvider for CtabCompletionProvider {
             this.update(cx, |this, cx| {
                 this.pending_refresh = None;
 
+                // Clean up request from debounce manager
+                request_state.debounce.remove_request(&request_id);
+
                 match response {
                     Ok(parse_result) => {
                         // Update model info
@@ -1960,6 +2191,7 @@ impl EditPredictionProvider for CtabCompletionProvider {
 
                         if parse_result.edits.is_empty() {
                             log::debug!("Ctab: [Multidiff] No edits received");
+                            request_state.clear_current_request(&current_file_path);
                             return;
                         }
 
@@ -1973,6 +2205,36 @@ impl EditPredictionProvider for CtabCompletionProvider {
                         let first_edit = &parse_result.edits[0];
                         let api_range = Some(first_edit.range);
 
+                        // Check if this request was superseded
+                        let is_current = request_state.is_current_request(&current_file_path, &request_id);
+
+                        if !is_current {
+                            // Request was superseded - cache the result instead of discarding
+                            log::info!(
+                                "Ctab: Request {} superseded, caching result",
+                                &request_id[..16.min(request_id.len())]
+                            );
+
+                            // Determine if we should retrigger
+                            let should_retrigger = parse_result
+                                .cursor_prediction
+                                .as_ref()
+                                .map(|p| p.should_retrigger_cpp)
+                                .unwrap_or(parse_result.edits.len() > 1);
+
+                            request_state.cache.add(CachedSuggestion {
+                                text: first_edit.text.clone(),
+                                binding_id: first_edit.binding_id.clone(),
+                                api_range,
+                                document_path: current_file_path.clone(),
+                                buffer_version,
+                                timestamp: std::time::Instant::now(),
+                                should_retrigger,
+                                request_id: request_id.clone(),
+                            });
+                            return;
+                        }
+
                         log::info!(
                             "Ctab: [Multidiff] First edit: lines {}-{}, text_len={}",
                             first_edit.range.0,
@@ -1981,12 +2243,14 @@ impl EditPredictionProvider for CtabCompletionProvider {
                         );
 
                         // Store remaining edits in followup queue
-                        if parse_result.edits.len() > 1 {
+                        let has_followups = parse_result.edits.len() > 1;
+                        if has_followups {
                             let followup_edits: Vec<EditPart> =
                                 parse_result.edits[1..].to_vec();
                             log::info!(
-                                "Ctab: [Multidiff] Queueing {} followup edits",
-                                followup_edits.len()
+                                "Ctab: [Multidiff] Queueing {} followup edits, has_cursor_prediction={}",
+                                followup_edits.len(),
+                                parse_result.cursor_prediction.is_some()
                             );
 
                             let buffer_ref = buffer_for_diff.read(cx);
@@ -1994,7 +2258,16 @@ impl EditPredictionProvider for CtabCompletionProvider {
                                 document_path: current_file_path.clone(),
                                 queue: followup_edits,
                                 buffer_version: buffer_ref.version(),
+                                cursor_prediction: parse_result.cursor_prediction.clone(),
                             });
+
+                            // Register next action for multidiff
+                            let action_id = first_edit.binding_id.clone().unwrap_or_else(|| request_id.clone());
+                            request_state.next_action.register(
+                                action_id,
+                                NextActionType::NextEdit,
+                                request_id.clone(),
+                            );
                         } else {
                             this.followup_session = None;
                         }
@@ -2032,12 +2305,44 @@ impl EditPredictionProvider for CtabCompletionProvider {
                             .cursor_prediction
                             .as_ref()
                             .map(|p| p.should_retrigger_cpp)
-                            .unwrap_or(this.followup_session.is_some()); // Retrigger if there are followups
+                            .unwrap_or(has_followups); // Retrigger if there are followups
 
-                        // Check for cross-file cursor prediction and try to preload target buffer
+                        // Check for cursor prediction - only register as next action if NO followup edits
+                        // When there are followups, cursor_prediction is stored in FollowupSession
+                        // and will be handled after all followup edits are done
                         let jump_target = if let Some(ref prediction) = parse_result.cursor_prediction {
                             // Check if prediction is for a different file
                             let is_cross_file = prediction.relative_path != current_file_path;
+
+                            // Only register CursorPrediction as next action if this is the ONLY edit
+                            // (no followups). When there are followups, the cursor_prediction is
+                            // stored in FollowupSession and will be handled after all edits.
+                            if !has_followups {
+                                log::info!(
+                                    "Ctab: [CursorPrediction] Registering for single edit: {}:{} (cross_file={})",
+                                    prediction.relative_path,
+                                    prediction.line_number_one_indexed,
+                                    is_cross_file
+                                );
+                                let action_id = first_edit.binding_id.clone().unwrap_or_else(|| request_id.clone());
+                                request_state.next_action.register(
+                                    action_id,
+                                    NextActionType::CursorPrediction {
+                                        relative_path: prediction.relative_path.clone(),
+                                        line_number_one_indexed: prediction.line_number_one_indexed,
+                                        should_retrigger: prediction.should_retrigger_cpp,
+                                    },
+                                    request_id.clone(),
+                                );
+                            } else {
+                                log::info!(
+                                    "Ctab: [CursorPrediction] Deferring until followups complete: {}:{} ({} edits remaining)",
+                                    prediction.relative_path,
+                                    prediction.line_number_one_indexed,
+                                    parse_result.edits.len() - 1
+                                );
+                            }
+
                             if is_cross_file {
                                 log::info!(
                                     "Ctab: [CursorPrediction] Cross-file jump detected: {} -> {}:{}",
@@ -2045,6 +2350,7 @@ impl EditPredictionProvider for CtabCompletionProvider {
                                     prediction.relative_path,
                                     prediction.line_number_one_indexed
                                 );
+
                                 // Try to find and open the target buffer
                                 if let Some(ref project) = this.project {
                                     Self::try_preload_jump_target(
@@ -2058,11 +2364,25 @@ impl EditPredictionProvider for CtabCompletionProvider {
                                     None
                                 }
                             } else {
+                                // Same-file cursor prediction - create jump target within current buffer
                                 log::info!(
                                     "Ctab: [CursorPrediction] Same-file prediction: line {}",
                                     prediction.line_number_one_indexed
                                 );
-                                None
+
+                                // Create jump target within current buffer
+                                let line = (prediction.line_number_one_indexed - 1).max(0) as u32;
+                                let point = Point::new(line, 0);
+                                let clamped_point = buffer_snapshot.clip_point(point, language::Bias::Left);
+                                let target_anchor = buffer_snapshot.anchor_before(clamped_point);
+
+                                log::info!(
+                                    "Ctab: [CursorPrediction] Same-file jump target: line {} -> anchor at {:?}",
+                                    prediction.line_number_one_indexed,
+                                    clamped_point
+                                );
+
+                                Some((buffer_snapshot.clone(), target_anchor))
                             }
                         } else {
                             None
@@ -2088,6 +2408,7 @@ impl EditPredictionProvider for CtabCompletionProvider {
                     }
                     Err(e) => {
                         log::error!("Ctab: [Multidiff] Failed to fetch completion: {}", e);
+                        request_state.clear_current_request(&current_file_path);
                     }
                 }
             })?;
@@ -2123,13 +2444,51 @@ impl EditPredictionProvider for CtabCompletionProvider {
                 self.trigger_append(changes, cx);
             }
 
-            // Check for followup edits (multidiff support)
+            // Clear trigger cooldown on accept (user is engaged)
+            self.request_state.trigger.clear_cooldown();
+
+            // Check for next action (multidiff followup or cursor prediction)
+            let action_id = completion.binding_id.clone().unwrap_or_default();
+            if let Some(next_action) = self.request_state.next_action.take(&action_id) {
+                match next_action {
+                    NextActionType::NextEdit => {
+                        log::info!("Ctab: [NextAction] Triggering next edit in multidiff sequence");
+                        // The next refresh will pick up from the followup queue
+                        // Set flag to update followup session version instead of invalidating
+                        self.followup_version_update_pending = true;
+                        return;
+                    }
+                    NextActionType::CursorPrediction {
+                        relative_path,
+                        line_number_one_indexed,
+                        should_retrigger,
+                    } => {
+                        log::info!(
+                            "Ctab: [NextAction] Cursor prediction to {}:{}",
+                            relative_path,
+                            line_number_one_indexed
+                        );
+                        // The jump target should already be preloaded in completion.jump_target
+                        // The editor will handle the navigation
+                        if !should_retrigger {
+                            self.skip_next_refresh = true;
+                        }
+                        return;
+                    }
+                }
+            }
+
+            // Check for followup edits (multidiff support) - fallback if next_action wasn't set
             if let Some(ref mut session) = self.followup_session {
                 if !session.queue.is_empty() {
                     log::info!(
                         "Ctab: [Multidiff] {} followup edits remaining after accept",
                         session.queue.len()
                     );
+                    // Set flag to update followup session version instead of invalidating
+                    // This is critical - without this, the buffer version change from accepting
+                    // the edit will cause the followup session to be cleared
+                    self.followup_version_update_pending = true;
                     // Don't skip next refresh - we want to show the next edit
                     // The next refresh will pick up from the followup queue
                     return;
@@ -2149,9 +2508,21 @@ impl EditPredictionProvider for CtabCompletionProvider {
 
     fn discard(&mut self, cx: &mut Context<Self>) {
         if let Some(completion) = self.current_completion.take() {
-            if let Some(binding_id) = completion.binding_id {
-                self.send_fate(binding_id, CppFate::Reject, cx);
+            if let Some(ref binding_id) = completion.binding_id {
+                self.send_fate(binding_id.clone(), CppFate::Reject, cx);
+
+                // Clear any pending next actions for this completion
+                self.request_state.next_action.remove(binding_id);
             }
+
+            // Record rejection for trigger cooldown
+            self.request_state.trigger.record_rejection();
+
+            // Clear followup session on discard
+            if let Some(ref file_path) = self.current_file_path {
+                self.request_state.cache.clear_for_document(file_path);
+            }
+            self.followup_session = None;
         }
     }
 
@@ -2168,8 +2539,44 @@ impl EditPredictionProvider for CtabCompletionProvider {
             return None;
         }
 
-        // PRIORITY: Check for cross-file jump target first
-        // If we have a preloaded jump target, return Jump prediction
+        // PRIORITY 1: If there are precomputed edits, return Local prediction
+        // Edits take priority over jump - we want to apply edits first, then jump
+        if let Some(precomputed_edits) = completion.precomputed_edits.as_ref() {
+            if !precomputed_edits.is_empty() {
+                let original_snapshot = completion.original_snapshot.as_ref()?;
+
+                // Get current buffer snapshot for interpolation
+                let current_snapshot = buffer.read(cx).snapshot();
+
+                // Interpolate edits to account for user typing since completion was computed
+                // This is lightweight - just anchor adjustment, no heavy computation
+                let edits = crate::snapshot_differ::interpolate_edits(
+                    original_snapshot,
+                    &current_snapshot,
+                    precomputed_edits,
+                )?;
+
+                if !edits.is_empty() {
+                    log::debug!(
+                        "Ctab: suggest() returning {} interpolated edits for completion {:?}",
+                        edits.len(),
+                        completion.binding_id
+                    );
+
+                    return Some(EditPrediction::Local {
+                        id: completion
+                            .binding_id
+                            .as_ref()
+                            .map(|id| SharedString::from(id.clone())),
+                        edits,
+                        edit_preview: None,
+                    });
+                }
+            }
+        }
+
+        // PRIORITY 2: If no edits (or edits are empty), check for jump target
+        // This handles both cross-file and same-file cursor predictions
         if let Some((ref target_snapshot, ref target_anchor)) = completion.jump_target {
             log::info!(
                 "Ctab: [CursorPrediction] Returning Jump prediction to {:?}",
@@ -2188,46 +2595,8 @@ impl EditPredictionProvider for CtabCompletionProvider {
             });
         }
 
-        // Get pre-computed edits and original snapshot for interpolation
-        let precomputed_edits = completion.precomputed_edits.as_ref()?;
-        let original_snapshot = completion.original_snapshot.as_ref()?;
-
-        if precomputed_edits.is_empty() {
-            log::debug!("Ctab: No pre-computed edits available, skipping");
-            return None;
-        }
-
-        // Get current buffer snapshot for interpolation
-        let current_snapshot = buffer.read(cx).snapshot();
-
-        // Interpolate edits to account for user typing since completion was computed
-        // This is lightweight - just anchor adjustment, no heavy computation
-        let edits = crate::snapshot_differ::interpolate_edits(
-            original_snapshot,
-            &current_snapshot,
-            precomputed_edits,
-        )?;
-
-        if edits.is_empty() {
-            log::debug!("Ctab: Interpolation resulted in empty edits, skipping");
-            return None;
-        }
-
-        // DEBUG: Log edit info (lightweight)
-        log::debug!(
-            "Ctab: suggest() returning {} interpolated edits for completion {:?}",
-            edits.len(),
-            completion.binding_id
-        );
-
-        Some(EditPrediction::Local {
-            id: completion
-                .binding_id
-                .as_ref()
-                .map(|id| SharedString::from(id.clone())),
-            edits,
-            edit_preview: None,
-        })
+        log::debug!("Ctab: No edits or jump target available, skipping");
+        None
     }
 }
 
