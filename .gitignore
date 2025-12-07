@@ -41,3 +41,7 @@ xcuserdata/
 .env.secret.toml
 Cometix-Tab
 Claude
+AGS_SDK_*
+bundle-custom.ps1
+inno/
+conpty
