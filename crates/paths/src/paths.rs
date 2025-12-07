@@ -17,16 +17,16 @@ static CUSTOM_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The resolved data directory, combining custom override or platform defaults.
 /// This is set once and cached for subsequent calls.
-/// On macOS, this is `~/Library/Application Support/Zed-C`.
-/// On Linux/FreeBSD, this is `$XDG_DATA_HOME/zed-c`.
-/// On Windows, this is `%LOCALAPPDATA%\Zed-C`.
+/// On macOS, this is `~/Library/Application Support/{APP_NAME}`.
+/// On Linux/FreeBSD, this is `$XDG_DATA_HOME/{app_name_lowercase}`.
+/// On Windows, this is `%LOCALAPPDATA%\{APP_NAME}`.
 static CURRENT_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The resolved config directory, combining custom override or platform defaults.
 /// This is set once and cached for subsequent calls.
-/// On macOS, this is `~/.config/zed-c`.
-/// On Linux/FreeBSD, this is `$XDG_CONFIG_HOME/zed-c`.
-/// On Windows, this is `%APPDATA%\Zed-C`.
+/// On macOS, this is `~/.config/{app_name_lowercase}`.
+/// On Linux/FreeBSD, this is `$XDG_CONFIG_HOME/{app_name_lowercase}`.
+/// On Windows, this is `%APPDATA%\{APP_NAME}`.
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Returns the relative path to the zed_server directory on the ssh host.
@@ -88,16 +88,18 @@ pub fn config_dir() -> &'static PathBuf {
         } else if cfg!(target_os = "windows") {
             dirs::config_dir()
                 .expect("failed to determine RoamingAppData directory")
-                .join("Zed-C")
+                .join(branding::directories::WINDOWS_CONFIG)
         } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             if let Ok(flatpak_xdg_config) = std::env::var("FLATPAK_XDG_CONFIG_HOME") {
                 flatpak_xdg_config.into()
             } else {
                 dirs::config_dir().expect("failed to determine XDG_CONFIG_HOME directory")
             }
-            .join("zed-c")
+            .join(branding::directories::LINUX_CONFIG)
         } else {
-            home_dir().join(".config").join("zed-c")
+            home_dir()
+                .join(".config")
+                .join(branding::directories::LINUX_CONFIG)
         }
     })
 }
@@ -108,18 +110,20 @@ pub fn data_dir() -> &'static PathBuf {
         if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
             custom_dir.clone()
         } else if cfg!(target_os = "macos") {
-            home_dir().join("Library/Application Support/Zed-C")
+            home_dir()
+                .join("Library/Application Support")
+                .join(branding::directories::MACOS_APP_SUPPORT)
         } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             if let Ok(flatpak_xdg_data) = std::env::var("FLATPAK_XDG_DATA_HOME") {
                 flatpak_xdg_data.into()
             } else {
                 dirs::data_local_dir().expect("failed to determine XDG_DATA_HOME directory")
             }
-            .join("zed-c")
+            .join(branding::directories::LINUX_DATA)
         } else if cfg!(target_os = "windows") {
             dirs::data_local_dir()
                 .expect("failed to determine LocalAppData directory")
-                .join("Zed-C")
+                .join(branding::directories::WINDOWS_DATA)
         } else {
             config_dir().clone() // Fallback
         }
@@ -133,13 +137,13 @@ pub fn temp_dir() -> &'static PathBuf {
         if cfg!(target_os = "macos") {
             return dirs::cache_dir()
                 .expect("failed to determine cachesDirectory directory")
-                .join("Zed-C");
+                .join(branding::directories::MACOS_CACHE);
         }
 
         if cfg!(target_os = "windows") {
             return dirs::cache_dir()
                 .expect("failed to determine LocalAppData directory")
-                .join("Zed-C");
+                .join(branding::directories::WINDOWS_CACHE);
         }
 
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
@@ -148,10 +152,12 @@ pub fn temp_dir() -> &'static PathBuf {
             } else {
                 dirs::cache_dir().expect("failed to determine XDG_CACHE_HOME directory")
             }
-            .join("zed-c");
+            .join(branding::directories::LINUX_CACHE);
         }
 
-        home_dir().join(".cache").join("zed-c")
+        home_dir()
+            .join(".cache")
+            .join(branding::directories::LINUX_CACHE)
     })
 }
 
@@ -166,7 +172,9 @@ pub fn logs_dir() -> &'static PathBuf {
     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();
     LOGS_DIR.get_or_init(|| {
         if cfg!(target_os = "macos") {
-            home_dir().join("Library/Logs/Zed-C")
+            home_dir()
+                .join("Library/Logs")
+                .join(branding::directories::MACOS_LOGS)
         } else {
             data_dir().join("logs")
         }

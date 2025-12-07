@@ -2288,6 +2288,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "branding"
+version = "0.1.0"
+
+[[package]]
 name = "breadcrumbs"
 version = "0.1.0"
 dependencies = [
@@ -2984,6 +2988,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "askpass",
+ "branding",
  "clap",
  "collections",
  "core-foundation 0.10.0",
@@ -8271,6 +8276,7 @@ name = "install_cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "branding",
  "client",
  "gpui",
  "release_channel",
@@ -11304,6 +11310,7 @@ dependencies = [
 name = "paths"
 version = "0.1.0"
 dependencies = [
+ "branding",
  "dirs 4.0.0",
  "ignore",
  "util",
@@ -13401,6 +13408,7 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 name = "release_channel"
 version = "0.1.0"
 dependencies = [
+ "branding",
  "gpui",
  "semver",
 ]
@@ -20566,6 +20574,7 @@ dependencies = [
  "auto_update",
  "auto_update_ui",
  "bincode",
+ "branding",
  "breadcrumbs",
  "call",
  "channel",

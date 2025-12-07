@@ -18,7 +18,7 @@ actions!(
 
 async fn install_script(cx: &AsyncApp) -> Result<PathBuf> {
     let cli_path = cx.update(|cx| cx.path_for_auxiliary_executable("cli"))??;
-    let link_path = Path::new("/usr/local/bin/zed-c");
+    let link_path = Path::new(branding::binary_paths::MACOS_CLI_PATH);
     let bin_dir_path = link_path.parent().unwrap();
 
     // Don't re-create symlink if it points to the same CLI binary.
@@ -86,7 +86,8 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
                 Toast::new(
                     NotificationId::unique::<InstalledZedCli>(),
                     format!(
-                        "Installed `zed-c` to {}. You can launch {} from your terminal.",
+                        "Installed `{}` to {}. You can launch {} from your terminal.",
+                        branding::CLI_NAME,
                         path.to_string_lossy(),
                         ReleaseChannel::global(cx).display_name()
                     ),
@@ -97,5 +98,10 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
         register_zed_scheme(cx).await.log_err();
         Ok(())
     })
-    .detach_and_prompt_err("Error installing zed-c cli", window, cx, |_, _, _| None);
+    .detach_and_prompt_err(
+        &format!("Error installing {} cli", branding::CLI_NAME),
+        window,
+        cx,
+        |_, _, _| None,
+    );
 }

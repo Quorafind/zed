@@ -23,6 +23,7 @@ default = []
 [dependencies]
 anyhow.workspace = true
 askpass.workspace = true
+branding.workspace = true
 clap.workspace = true
 collections.workspace = true
 ipc-channel = "0.19"

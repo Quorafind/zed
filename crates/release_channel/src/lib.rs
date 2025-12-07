@@ -28,10 +28,10 @@ pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
 #[cfg(target_os = "windows")]
 pub fn app_identifier() -> &'static str {
     match *RELEASE_CHANNEL {
-        ReleaseChannel::Dev => "Zed-C-Dev",
-        ReleaseChannel::Nightly => "Zed-C-Nightly",
-        ReleaseChannel::Preview => "Zed-C-Preview",
-        ReleaseChannel::Stable => "Zed-C-Stable",
+        ReleaseChannel::Dev => branding::windows_app_ids::DEV,
+        ReleaseChannel::Nightly => branding::windows_app_ids::NIGHTLY,
+        ReleaseChannel::Preview => branding::windows_app_ids::PREVIEW,
+        ReleaseChannel::Stable => branding::windows_app_ids::STABLE,
     }
 }
 
@@ -173,10 +173,10 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Zed C Dev",
-            ReleaseChannel::Nightly => "Zed C Nightly",
-            ReleaseChannel::Preview => "Zed C Preview",
-            ReleaseChannel::Stable => "Zed C",
+            ReleaseChannel::Dev => branding::display_names::DEV,
+            ReleaseChannel::Nightly => branding::display_names::NIGHTLY,
+            ReleaseChannel::Preview => branding::display_names::PREVIEW,
+            ReleaseChannel::Stable => branding::display_names::STABLE,
         }
     }
 
@@ -195,10 +195,10 @@ impl ReleaseChannel {
     /// This also has to match the bundle identifier for Zed on macOS.
     pub fn app_id(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "dev.zed.Zed-C-Dev",
-            ReleaseChannel::Nightly => "dev.zed.Zed-C-Nightly",
-            ReleaseChannel::Preview => "dev.zed.Zed-C-Preview",
-            ReleaseChannel::Stable => "dev.zed.Zed-C",
+            ReleaseChannel::Dev => branding::app_ids::DEV,
+            ReleaseChannel::Nightly => branding::app_ids::NIGHTLY,
+            ReleaseChannel::Preview => branding::app_ids::PREVIEW,
+            ReleaseChannel::Stable => branding::app_ids::STABLE,
         }
     }
 

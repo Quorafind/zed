@@ -675,13 +675,9 @@ mod linux {
                 let cli = env::current_exe()?;
                 let dir = cli.parent().context("no parent path for cli")?;
 
-                // libexec is the standard, lib/zed-c is for Arch (and other non-libexec distros),
-                // ./zed-c is for the target directory in development builds.
-                let possible_locations = [
-                    "../libexec/zed-c-editor",
-                    "../lib/zed-ctab/zed-c-editor",
-                    "./zed-c",
-                ];
+                // libexec is the standard, lib/{app} is for Arch (and other non-libexec distros),
+                // ./{app} is for the target directory in development builds.
+                let possible_locations = branding::binary_paths::linux::EDITOR_LOCATIONS;
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
@@ -714,7 +710,8 @@ mod linux {
 
         fn launch(&self, ipc_url: String) -> anyhow::Result<()> {
             let sock_path = paths::data_dir().join(format!(
-                "zed-c-{}.sock",
+                "{}{}.sock",
+                branding::SOCKET_PREFIX,
                 *release_channel::RELEASE_CHANNEL_NAME
             ));
             let sock = UnixDatagram::unbound()?;
@@ -997,13 +994,9 @@ mod windows {
                 let cli = std::env::current_exe()?;
                 let dir = cli.parent().context("no parent path for cli")?;
 
-                // ../Zed-C.exe is the standard, lib/zed-c is for MSYS2, ./zed-c.exe is for the target
+                // ../{APP}.exe is the standard, lib/{app} is for MSYS2, ./{app}.exe is for the target
                 // directory in development builds.
-                let possible_locations = [
-                    "../Zed-C.exe",
-                    "../lib/zed-c/zed-c-editor.exe",
-                    "./zed-c.exe",
-                ];
+                let possible_locations = branding::binary_paths::windows::EDITOR_LOCATIONS;
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
