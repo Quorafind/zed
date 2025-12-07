@@ -1,4 +1,4 @@
-//! Cometix edit prediction delegate implementation
+//! Ctab edit prediction delegate implementation
 //!
 //! Implements the EditPredictionDelegate trait for Cursor AI completions.
 
@@ -1091,7 +1091,7 @@ impl CtabEditPredictionDelegate {
                 .map(|d| d.as_millis() as f32)
                 .unwrap_or(0.0),
             fate: fate.into(),
-            extension: "zed-cometix".to_string(),
+            extension: "zed-ctab".to_string(),
         };
 
         let body = request.encode_to_vec();
@@ -1660,11 +1660,11 @@ impl CtabEditPredictionDelegate {
 
 impl EditPredictionDelegate for CtabEditPredictionDelegate {
     fn name() -> &'static str {
-        "cometix"
+        "ctab"
     }
 
     fn display_name() -> &'static str {
-        "Cometix"
+        "Ctab"
     }
 
     fn show_predictions_in_menu() -> bool {
@@ -2763,7 +2763,7 @@ impl EditPredictionDelegate for CtabEditPredictionDelegate {
         _direction: Direction,
         _cx: &mut Context<Self>,
     ) {
-        // Cometix doesn't support cycling through completions
+        // Ctab doesn't support cycling through completions
     }
 
     fn accept(&mut self, cx: &mut Context<Self>) {

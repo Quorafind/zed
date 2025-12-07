@@ -1,4 +1,4 @@
-//! Edit history and diff tracking for Cometix
+//! Edit history and diff tracking for Ctab
 //!
 //! This module tracks file changes and builds diff history strings
 //! that the Cursor API expects for context.

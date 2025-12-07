@@ -1,7 +1,7 @@
 syntax = "proto3";
 package aiserver.v1;
 
-// Core message types for Cometix completion API
+// Core message types for Ctab completion API
 // Enhanced version for Zed integration with high-priority fields
 
 // Position types

@@ -1,15 +1,13 @@
 use anyhow::Result;
 use client::{Client, UserStore, zed_urls};
 use cloud_llm_client::UsageLimit;
-use codestral::CodestralEditPredictionDelegate;
+use codestral::CodestralCompletionProvider;
 use copilot::{Copilot, Status};
 use ctab::CtabSettings;
-use edit_prediction::{MercuryFeatureFlag, SweepFeatureFlag, Zeta2FeatureFlag};
-use edit_prediction_types::EditPredictionDelegateHandle;
 use editor::{
     Editor, MultiBufferOffset, SelectionEffects, actions::ShowEditPrediction, scroll::Autoscroll,
 };
-use feature_flags::FeatureFlagAppExt;
+use feature_flags::{FeatureFlagAppExt, PredictEditsRateCompletionsFeatureFlag};
 use fs::Fs;
 use gpui::{
     Action, Animation, AnimationExt, App, AsyncWindowContext, Corner, Entity, FocusHandle,
@@ -24,7 +22,6 @@ use language::{
 use project::DisableAiSettings;
 use regex::Regex;
 use settings::{
-    EXPERIMENTAL_MERCURY_EDIT_PREDICTION_PROVIDER_NAME,
     EXPERIMENTAL_SWEEP_EDIT_PREDICTION_PROVIDER_NAME,
     EXPERIMENTAL_ZETA2_EDIT_PREDICTION_PROVIDER_NAME, Settings, SettingsStore,
     update_settings_file,
@@ -44,11 +41,8 @@ use workspace::{
     notifications::NotificationId,
 };
 use zed_actions::OpenBrowser;
-
-use crate::{
-    ExternalProviderApiKeyModal, RatePredictions,
-    rate_prediction_modal::PredictEditsRatePredictionsFeatureFlag,
-};
+use zeta::RateCompletions;
+use zeta::{SweepFeatureFlag, Zeta2FeatureFlag};
 
 actions!(
     edit_prediction,
@@ -71,7 +65,7 @@ pub struct EditPredictionButton {
     editor_focus_handle: Option<FocusHandle>,
     language: Option<Arc<Language>>,
     file: Option<Arc<dyn File>>,
-    edit_prediction_provider: Option<Arc<dyn EditPredictionDelegateHandle>>,
+    edit_prediction_provider: Option<Arc<dyn edit_prediction::EditPredictionProviderHandle>>,
     fs: Arc<dyn Fs>,
     user_store: Entity<UserStore>,
     popover_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -248,7 +242,7 @@ impl Render for EditPredictionButton {
 
             EditPredictionProvider::Codestral => {
                 let enabled = self.editor_enabled.unwrap_or(true);
-                let has_api_key = CodestralEditPredictionDelegate::has_api_key(cx);
+                let has_api_key = CodestralCompletionProvider::has_api_key(cx);
                 let fs = self.fs.clone();
                 let this = cx.weak_entity();
 
@@ -313,34 +307,20 @@ impl Render for EditPredictionButton {
             provider @ (EditPredictionProvider::Experimental(_) | EditPredictionProvider::Zed) => {
                 let enabled = self.editor_enabled.unwrap_or(true);
 
-                let ep_icon;
-                let mut missing_token = false;
+                let is_sweep = matches!(
+                    provider,
+                    EditPredictionProvider::Experimental(
+                        EXPERIMENTAL_SWEEP_EDIT_PREDICTION_PROVIDER_NAME
+                    )
+                );
 
-                match provider {
-                    EditPredictionProvider::Experimental(
-                        EXPERIMENTAL_SWEEP_EDIT_PREDICTION_PROVIDER_NAME,
-                    ) => {
-                        ep_icon = IconName::SweepAi;
-                        missing_token = edit_prediction::EditPredictionStore::try_global(cx)
-                            .is_some_and(|ep_store| !ep_store.read(cx).has_sweep_api_token());
-                    }
-                    EditPredictionProvider::Experimental(
-                        EXPERIMENTAL_MERCURY_EDIT_PREDICTION_PROVIDER_NAME,
-                    ) => {
-                        ep_icon = IconName::Inception;
-                        missing_token = edit_prediction::EditPredictionStore::try_global(cx)
-                            .is_some_and(|ep_store| !ep_store.read(cx).has_mercury_api_token());
-                    }
-                    _ => {
-                        ep_icon = if enabled {
-                            IconName::ZedPredict
-                        } else {
-                            IconName::ZedPredictDisabled
-                        };
-                    }
+                let zeta_icon = match (is_sweep, enabled) {
+                    (true, _) => IconName::SweepAi,
+                    (false, true) => IconName::ZedPredict,
+                    (false, false) => IconName::ZedPredictDisabled,
                 };
 
-                if edit_prediction::should_show_upsell_modal() {
+                if zeta::should_show_upsell_modal() {
                     let tooltip_meta = if self.user_store.read(cx).current_user().is_some() {
                         "Choose a Plan"
                     } else {
@@ -348,7 +328,7 @@ impl Render for EditPredictionButton {
                     };
 
                     return div().child(
-                        IconButton::new("zed-predict-pending-button", ep_icon)
+                        IconButton::new("zed-predict-pending-button", zeta_icon)
                             .shape(IconButtonShape::Square)
                             .indicator(Indicator::dot().color(Color::Muted))
                             .indicator_border_color(Some(cx.theme().colors().status_bar_background))
@@ -381,24 +361,19 @@ impl Render for EditPredictionButton {
                 let show_editor_predictions = self.editor_show_predictions;
                 let user = self.user_store.read(cx).current_user();
 
-                let indicator_color = if missing_token {
-                    Some(Color::Error)
-                } else if enabled && (!show_editor_predictions || over_limit) {
-                    Some(if over_limit {
-                        Color::Error
-                    } else {
-                        Color::Muted
-                    })
-                } else {
-                    None
-                };
-
-                let icon_button = IconButton::new("zed-predict-pending-button", ep_icon)
+                let icon_button = IconButton::new("zed-predict-pending-button", zeta_icon)
                     .shape(IconButtonShape::Square)
-                    .when_some(indicator_color, |this, color| {
-                        this.indicator(Indicator::dot().color(color))
+                    .when(
+                        enabled && (!show_editor_predictions || over_limit),
+                        |this| {
+                            this.indicator(Indicator::dot().when_else(
+                                over_limit,
+                                |dot| dot.color(Color::Error),
+                                |dot| dot.color(Color::Muted),
+                            ))
                             .indicator_border_color(Some(cx.theme().colors().status_bar_background))
-                    })
+                        },
+                    )
                     .when(!self.popover_menu_handle.is_deployed(), |element| {
                         let user = user.clone();
                         element.tooltip(move |_window, cx| {
@@ -433,13 +408,13 @@ impl Render for EditPredictionButton {
 
                 let this = cx.weak_entity();
 
-                let mut popover_menu = PopoverMenu::new("edit-prediction")
+                let mut popover_menu = PopoverMenu::new("zeta")
                     .when(user.is_some(), |popover_menu| {
                         let this = this.clone();
 
                         popover_menu.menu(move |window, cx| {
                             this.update(cx, |this, cx| {
-                                this.build_edit_prediction_context_menu(provider, window, cx)
+                                this.build_zeta_context_menu(provider, window, cx)
                             })
                             .ok()
                         })
@@ -552,7 +527,7 @@ impl EditPredictionButton {
         cx.observe_global::<SettingsStore>(move |_, cx| cx.notify())
             .detach();
 
-        CodestralEditPredictionDelegate::ensure_api_key_loaded(client.http_client(), cx);
+        CodestralCompletionProvider::ensure_api_key_loaded(client.http_client(), cx);
 
         Self {
             editor_subscription: None,
@@ -587,7 +562,7 @@ impl EditPredictionButton {
             }
         }
 
-        if CodestralEditPredictionDelegate::has_api_key(cx) {
+        if CodestralCompletionProvider::has_api_key(cx) {
             providers.push(EditPredictionProvider::Codestral);
         }
 
@@ -597,12 +572,6 @@ impl EditPredictionButton {
         if cx.has_flag::<SweepFeatureFlag>() {
             providers.push(EditPredictionProvider::Experimental(
                 EXPERIMENTAL_SWEEP_EDIT_PREDICTION_PROVIDER_NAME,
-            ));
-        }
-
-        if cx.has_flag::<MercuryFeatureFlag>() {
-            providers.push(EditPredictionProvider::Experimental(
-                EXPERIMENTAL_MERCURY_EDIT_PREDICTION_PROVIDER_NAME,
             ));
         }
 
@@ -625,23 +594,23 @@ impl EditPredictionButton {
 
         const ZED_AI_CALLOUT: &str =
             "Zed's edit prediction is powered by Zeta, an open-source, dataset mode.";
+        const USE_SWEEP_API_TOKEN_CALLOUT: &str =
+            "Set the SWEEP_API_TOKEN environment variable to use Sweep";
 
-        let providers: Vec<_> = available_providers
+        let other_providers: Vec<_> = available_providers
             .into_iter()
-            .filter(|p| *p != EditPredictionProvider::None)
+            .filter(|p| *p != current_provider && *p != EditPredictionProvider::None)
             .collect();
 
-        if !providers.is_empty() {
-            menu = menu.separator().header("Providers");
+        if !other_providers.is_empty() {
+            menu = menu.separator().header("Switch Providers");
 
-            for provider in providers {
-                let is_current = provider == current_provider;
+            for provider in other_providers {
                 let fs = self.fs.clone();
 
                 menu = match provider {
                     EditPredictionProvider::Zed => menu.item(
                         ContextMenuEntry::new("Zed AI")
-                            .toggleable(IconPosition::Start, is_current)
                             .documentation_aside(
                                 DocumentationSide::Left,
                                 DocumentationEdge::Bottom,
@@ -651,27 +620,21 @@ impl EditPredictionButton {
                                 set_completion_provider(fs.clone(), cx, provider);
                             }),
                     ),
-                    EditPredictionProvider::Copilot => menu.item(
-                        ContextMenuEntry::new("GitHub Copilot")
-                            .toggleable(IconPosition::Start, is_current)
-                            .handler(move |_, cx| {
-                                set_completion_provider(fs.clone(), cx, provider);
-                            }),
-                    ),
-                    EditPredictionProvider::Supermaven => menu.item(
-                        ContextMenuEntry::new("Supermaven")
-                            .toggleable(IconPosition::Start, is_current)
-                            .handler(move |_, cx| {
-                                set_completion_provider(fs.clone(), cx, provider);
-                            }),
-                    ),
-                    EditPredictionProvider::Codestral => menu.item(
-                        ContextMenuEntry::new("Codestral")
-                            .toggleable(IconPosition::Start, is_current)
-                            .handler(move |_, cx| {
-                                set_completion_provider(fs.clone(), cx, provider);
-                            }),
-                    ),
+                    EditPredictionProvider::Copilot => {
+                        menu.entry("GitHub Copilot", None, move |_, cx| {
+                            set_completion_provider(fs.clone(), cx, provider);
+                        })
+                    }
+                    EditPredictionProvider::Supermaven => {
+                        menu.entry("Supermaven", None, move |_, cx| {
+                            set_completion_provider(fs.clone(), cx, provider);
+                        })
+                    }
+                    EditPredictionProvider::Codestral => {
+                        menu.entry("Codestral", None, move |_, cx| {
+                            set_completion_provider(fs.clone(), cx, provider);
+                        })
+                    }
                     EditPredictionProvider::Ctab => {
                         let settings = CtabSettings::get_global(cx);
                         let has_auth_token = settings.auth_token.is_some();
@@ -681,135 +644,48 @@ impl EditPredictionButton {
                         let requires_auth_token =
                             matches!(settings.endpoint_type, ctab::EndpointType::Official);
 
-                        menu.item(
-                            ContextMenuEntry::new("Ctab")
-                                .toggleable(IconPosition::Start, is_current)
-                                .when(requires_auth_token && !has_auth_token, |this| {
-                                    this.documentation_aside(
-                                        DocumentationSide::Left,
-                                        DocumentationEdge::Bottom,
-                                        |_| {
-                                            Label::new(
-                                                "Configure auth_token in settings to use Ctab",
-                                            )
-                                            .into_any_element()
-                                        },
-                                    )
-                                })
-                                .handler(move |_, cx| {
-                                    set_completion_provider(fs.clone(), cx, provider);
-                                }),
-                        )
-                    }
-                    EditPredictionProvider::Experimental(
-                        EXPERIMENTAL_SWEEP_EDIT_PREDICTION_PROVIDER_NAME,
-                    ) => {
-                        let has_api_token = edit_prediction::EditPredictionStore::try_global(cx)
-                            .map_or(false, |ep_store| ep_store.read(cx).has_sweep_api_token());
-
-                        let should_open_modal = !has_api_token || is_current;
-
-                        let entry = if has_api_token {
-                            ContextMenuEntry::new("Sweep")
-                                .toggleable(IconPosition::Start, is_current)
-                        } else {
-                            ContextMenuEntry::new("Sweep")
-                                .icon(IconName::XCircle)
-                                .icon_color(Color::Error)
-                                .documentation_aside(
+                        let entry = ContextMenuEntry::new("Ctab")
+                            .when(requires_auth_token && !has_auth_token, |this| {
+                                this.documentation_aside(
                                     DocumentationSide::Left,
                                     DocumentationEdge::Bottom,
                                     |_| {
-                                        Label::new("Click to configure your Sweep API token")
+                                        Label::new("Configure auth_token in settings to use Ctab")
                                             .into_any_element()
                                     },
                                 )
-                        };
-
-                        let entry = entry.handler(move |window, cx| {
-                            if should_open_modal {
-                                if let Some(workspace) = window.root::<Workspace>().flatten() {
-                                    workspace.update(cx, |workspace, cx| {
-                                        workspace.toggle_modal(window, cx, |window, cx| {
-                                            ExternalProviderApiKeyModal::new(
-                                                window,
-                                                cx,
-                                                |api_key, store, cx| {
-                                                    store
-                                                        .sweep_ai
-                                                        .set_api_token(api_key, cx)
-                                                        .detach_and_log_err(cx);
-                                                },
-                                            )
-                                        });
-                                    });
-                                };
-                            } else {
+                            })
+                            .handler(move |_, cx| {
                                 set_completion_provider(fs.clone(), cx, provider);
-                            }
-                        });
+                            });
 
                         menu.item(entry)
                     }
                     EditPredictionProvider::Experimental(
-                        EXPERIMENTAL_MERCURY_EDIT_PREDICTION_PROVIDER_NAME,
+                        EXPERIMENTAL_SWEEP_EDIT_PREDICTION_PROVIDER_NAME,
                     ) => {
-                        let has_api_token = edit_prediction::EditPredictionStore::try_global(cx)
-                            .map_or(false, |ep_store| ep_store.read(cx).has_mercury_api_token());
+                        let has_api_token = zeta::Zeta::try_global(cx)
+                            .map_or(false, |zeta| zeta.read(cx).has_sweep_api_token());
 
-                        let should_open_modal = !has_api_token || is_current;
-
-                        let entry = if has_api_token {
-                            ContextMenuEntry::new("Mercury")
-                                .toggleable(IconPosition::Start, is_current)
-                        } else {
-                            ContextMenuEntry::new("Mercury")
-                                .icon(IconName::XCircle)
-                                .icon_color(Color::Error)
-                                .documentation_aside(
+                        let entry = ContextMenuEntry::new("Sweep")
+                            .when(!has_api_token, |this| {
+                                this.disabled(true).documentation_aside(
                                     DocumentationSide::Left,
                                     DocumentationEdge::Bottom,
-                                    |_| {
-                                        Label::new("Click to configure your Mercury API token")
-                                            .into_any_element()
-                                    },
+                                    |_| Label::new(USE_SWEEP_API_TOKEN_CALLOUT).into_any_element(),
                                 )
-                        };
-
-                        let entry = entry.handler(move |window, cx| {
-                            if should_open_modal {
-                                if let Some(workspace) = window.root::<Workspace>().flatten() {
-                                    workspace.update(cx, |workspace, cx| {
-                                        workspace.toggle_modal(window, cx, |window, cx| {
-                                            ExternalProviderApiKeyModal::new(
-                                                window,
-                                                cx,
-                                                |api_key, store, cx| {
-                                                    store
-                                                        .mercury
-                                                        .set_api_token(api_key, cx)
-                                                        .detach_and_log_err(cx);
-                                                },
-                                            )
-                                        });
-                                    });
-                                };
-                            } else {
+                            })
+                            .handler(move |_, cx| {
                                 set_completion_provider(fs.clone(), cx, provider);
-                            }
-                        });
+                            });
 
                         menu.item(entry)
                     }
                     EditPredictionProvider::Experimental(
                         EXPERIMENTAL_ZETA2_EDIT_PREDICTION_PROVIDER_NAME,
-                    ) => menu.item(
-                        ContextMenuEntry::new("Zeta2")
-                            .toggleable(IconPosition::Start, is_current)
-                            .handler(move |_, cx| {
-                                set_completion_provider(fs.clone(), cx, provider);
-                            }),
-                    ),
+                    ) => menu.entry("Zeta2", None, move |_, cx| {
+                        set_completion_provider(fs.clone(), cx, provider);
+                    }),
                     EditPredictionProvider::None | EditPredictionProvider::Experimental(_) => {
                         continue;
                     }
@@ -1112,8 +988,8 @@ impl EditPredictionButton {
                 )
                 .context(editor_focus_handle)
                 .when(
-                    cx.has_flag::<PredictEditsRatePredictionsFeatureFlag>(),
-                    |this| this.action("Rate Predictions", RatePredictions.boxed_clone()),
+                    cx.has_flag::<PredictEditsRateCompletionsFeatureFlag>(),
+                    |this| this.action("Rate Completions", RateCompletions.boxed_clone()),
                 );
         }
 
@@ -1242,7 +1118,7 @@ impl EditPredictionButton {
         })
     }
 
-    fn build_edit_prediction_context_menu(
+    fn build_zeta_context_menu(
         &self,
         provider: EditPredictionProvider,
         window: &mut Window,
@@ -1331,33 +1207,9 @@ impl EditPredictionButton {
                     .separator();
             }
 
-            menu = self.build_language_settings_menu(menu, window, cx);
+            let menu = self.build_language_settings_menu(menu, window, cx);
+            let menu = self.add_provider_switching_section(menu, provider, cx);
 
-            if cx.has_flag::<Zeta2FeatureFlag>() {
-                let settings = all_language_settings(None, cx);
-                let context_retrieval = settings.edit_predictions.use_context;
-                menu = menu.separator().header("Context Retrieval").item(
-                    ContextMenuEntry::new("Enable Context Retrieval")
-                        .toggleable(IconPosition::Start, context_retrieval)
-                        .action(workspace::ToggleEditPrediction.boxed_clone())
-                        .handler({
-                            let fs = self.fs.clone();
-                            move |_, cx| {
-                                update_settings_file(fs.clone(), cx, move |settings, _| {
-                                    settings
-                                        .project
-                                        .all_languages
-                                        .features
-                                        .get_or_insert_default()
-                                        .experimental_edit_prediction_context_retrieval =
-                                        Some(!context_retrieval)
-                                });
-                            }
-                        }),
-                );
-            }
-
-            menu = self.add_provider_switching_section(menu, provider, cx);
             menu
         })
     }
@@ -1371,8 +1223,8 @@ impl EditPredictionButton {
             menu = menu
                 .custom_row(move |_window, cx| {
                     let description = indoc! {
-                        "You get 2,000 accepted suggestions at every keystroke for free, \
-                        powered by Zeta, our open-source, open-data model"
+                        "Sign in for 2,000 worth of accepted suggestions at every keystroke, \
+                        powered by Zeta, our open-source, open-data model."
                     };
 
                     v_flex()
@@ -1625,28 +1477,21 @@ fn render_zeta_tab_animation(cx: &App) -> impl IntoElement {
                 .child("tab")
                 .with_animation(
                     ElementId::Integer(n),
-                    Animation::new(Duration::from_secs(3)).repeat(),
+                    Animation::new(Duration::from_secs(4)).repeat(),
                     move |tab, delta| {
                         let n_f32 = n as f32;
 
-                        let offset = if inverted {
-                            0.2 * (4.0 - n_f32)
+                        let delta = if inverted {
+                            (delta - 0.15 * (5.0 - n_f32)) / 0.7
                         } else {
-                            0.2 * n_f32
+                            (delta - 0.15 * n_f32) / 0.7
                         };
 
-                        let phase = (delta - offset + 1.0) % 1.0;
-                        let pulse = if phase < 0.6 {
-                            let t = phase / 0.6;
-                            1.0 - (0.5 - t).abs() * 2.0
-                        } else {
-                            0.0
-                        };
+                        let delta = 1.0 - (0.5 - delta).abs() * 2.;
+                        let delta = ease_in_out(delta.clamp(0., 1.));
+                        let delta = 0.1 + 0.5 * delta;
 
-                        let eased = ease_in_out(pulse);
-                        let opacity = 0.1 + 0.5 * eased;
-
-                        tab.text_color(text_color.opacity(opacity))
+                        tab.text_color(text_color.opacity(delta))
                     },
                 ),
         )

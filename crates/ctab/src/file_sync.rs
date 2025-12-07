@@ -1,4 +1,4 @@
-//! File synchronization service for Cometix
+//! File synchronization service for Ctab
 //!
 //! This module handles file synchronization with the Cursor API server,
 //! enabling the server to maintain an up-to-date view of the user's workspace.
