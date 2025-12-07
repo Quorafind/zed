@@ -14,7 +14,7 @@ workspace = true
 tracy = ["ztracing/tracy"]
 
 [[bin]]
-name = "zed"
+name = "zed-c"
 path = "src/zed-main.rs"
 
 [lib]

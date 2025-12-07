@@ -675,10 +675,13 @@ mod linux {
                 let cli = env::current_exe()?;
                 let dir = cli.parent().context("no parent path for cli")?;
 
-                // libexec is the standard, lib/zed is for Arch (and other non-libexec distros),
-                // ./zed is for the target directory in development builds.
-                let possible_locations =
-                    ["../libexec/zed-editor", "../lib/zed/zed-editor", "./zed"];
+                // libexec is the standard, lib/zed-c is for Arch (and other non-libexec distros),
+                // ./zed-c is for the target directory in development builds.
+                let possible_locations = [
+                    "../libexec/zed-c-editor",
+                    "../lib/zed-ctab/zed-c-editor",
+                    "./zed-c",
+                ];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
@@ -711,7 +714,7 @@ mod linux {
 
         fn launch(&self, ipc_url: String) -> anyhow::Result<()> {
             let sock_path = paths::data_dir().join(format!(
-                "zed-{}.sock",
+                "zed-c-{}.sock",
                 *release_channel::RELEASE_CHANNEL_NAME
             ));
             let sock = UnixDatagram::unbound()?;
@@ -994,9 +997,13 @@ mod windows {
                 let cli = std::env::current_exe()?;
                 let dir = cli.parent().context("no parent path for cli")?;
 
-                // ../Zed.exe is the standard, lib/zed is for MSYS2, ./zed.exe is for the target
+                // ../Zed-C.exe is the standard, lib/zed-c is for MSYS2, ./zed-c.exe is for the target
                 // directory in development builds.
-                let possible_locations = ["../Zed.exe", "../lib/zed/zed-editor.exe", "./zed.exe"];
+                let possible_locations = [
+                    "../Zed-C.exe",
+                    "../lib/zed-c/zed-c-editor.exe",
+                    "./zed-c.exe",
+                ];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
