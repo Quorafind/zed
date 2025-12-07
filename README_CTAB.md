@@ -1,6 +1,11 @@
-# CTab - Cursor Tab Completion for Zed
+# CTab - Another Tab Completion for Zed
 
-CTab 是一个为 Zed 编辑器实现的编辑预测提供器，兼容 Cursor AI 补全 API。
+CTab 是一个为 Zed 编辑器实现的编辑预测提供器，兼容 Cursor AI 补全 API，基于 [Haleclipse/Cometix-Tab](https://github.com/Haleclipse/Cometix-Tab) 的类似思路在 Zed 中实现的版本。
+
+> [!note]
+> 局限性：由于 Zed 的 Prediction API 迟迟不肯提供，所以当前情况下必须要修改 Zed 的本体源代码来实现转接 Cursor Tab 的补全 API。
+> 局限性2：我不擅长 Rust，所以代码质量可能不佳。感谢 Claude 等导师
+> 其它感谢在底部，注意，由于 Zed 的上游 API 随时会变动，所以本项目可能需要频繁更新以保持兼容性；也可能会在将来某一天直接迁移成独立的插件
 
 ## 功能特性
 
@@ -21,7 +26,7 @@ CTab 是一个为 Zed 编辑器实现的编辑预测提供器，兼容 Cursor AI
 - **异步预取** - 空闲时后台索引和 ripgrep 搜索
 - **上下文缓存** - 30 秒 TTL 的评分上下文缓存
 
-### 文件同步 (FileSyncManager)
+### 文件同步 (FileSyncManager) 【这部分功能实现存在一些问题，需要进一步优化和测试】
 
 - **增量同步** - 仅同步变更内容
 - **指数退避重试** - 失败时自动重试
@@ -49,7 +54,7 @@ CTab 是一个为 Zed 编辑器实现的编辑预测提供器，兼容 Cursor AI
 
 ## 配置
 
-在 Zed 的 `settings.json` 中添加：
+在 Zed 的 `settings.json` 中添加或在项目下的 `.zed/settings.json` 添加
 
 ```json
 {
