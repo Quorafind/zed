@@ -1,6 +1,6 @@
-//! Cometix completion provider implementation
+//! Cometix edit prediction delegate implementation
 //!
-//! Implements the EditPredictionProvider trait for Cursor AI completions.
+//! Implements the EditPredictionDelegate trait for Cursor AI completions.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clock;
-use edit_prediction::{Direction, EditPrediction, EditPredictionProvider};
+use edit_prediction_types::{Direction, EditPrediction, EditPredictionDelegate};
 use futures::AsyncReadExt;
 use gpui::{App, Context, Entity, EntityId, SharedString, Task};
 use http_client::{AsyncBody, HttpClient, Method};
@@ -57,7 +57,7 @@ impl CachedConfig {
     }
 }
 
-pub struct CtabCompletionProvider {
+pub struct CtabEditPredictionDelegate {
     http_client: Arc<dyn HttpClient>,
     project: Option<Entity<Project>>,
     diff_tracker: Arc<Mutex<DiffTracker>>,
@@ -178,7 +178,7 @@ struct MultidiffParseResult {
     is_multidiff_model: bool,
 }
 
-impl CtabCompletionProvider {
+impl CtabEditPredictionDelegate {
     pub fn new(http_client: Arc<dyn HttpClient>, project: Option<Entity<Project>>) -> Self {
         // Generate workspace_id - will be updated when we have project context
         let workspace_id = generate_workspace_id();
@@ -1658,7 +1658,7 @@ impl CtabCompletionProvider {
     }
 }
 
-impl EditPredictionProvider for CtabCompletionProvider {
+impl EditPredictionDelegate for CtabEditPredictionDelegate {
     fn name() -> &'static str {
         "cometix"
     }
@@ -1667,7 +1667,7 @@ impl EditPredictionProvider for CtabCompletionProvider {
         "Cometix"
     }
 
-    fn show_completions_in_menu() -> bool {
+    fn show_predictions_in_menu() -> bool {
         true
     }
 

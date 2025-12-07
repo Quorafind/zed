@@ -16,7 +16,7 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/aiserver.v1.rs"));
 }
 
-pub use completion_provider::CtabCompletionProvider;
+pub use completion_provider::CtabEditPredictionDelegate;
 
 use gpui::App;
 use settings::{RegisterSetting, Settings, SettingsContent};
