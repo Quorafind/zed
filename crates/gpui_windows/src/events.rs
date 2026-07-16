@@ -45,7 +45,7 @@ impl WindowsWindowInner {
                 unsafe { SetActiveWindow(handle).ok() };
                 None
             }
-            WM_ACTIVATE => self.handle_activate_msg(wparam),
+            WM_ACTIVATE => self.handle_activate_msg(handle, wparam),
             WM_CREATE => self.handle_create_msg(handle),
             WM_MOVE => self.handle_move_msg(handle, lparam),
             WM_SIZE => self.handle_size_msg(wparam, lparam),
@@ -727,7 +727,7 @@ impl WindowsWindowInner {
         }
     }
 
-    fn handle_activate_msg(self: &Rc<Self>, wparam: WPARAM) -> Option<isize> {
+    fn handle_activate_msg(self: &Rc<Self>, handle: HWND, wparam: WPARAM) -> Option<isize> {
         let activated = wparam.loword() > 0;
 
         let events = self
@@ -761,6 +761,33 @@ impl WindowsWindowInner {
                 });
                 func(input);
                 this.state.callbacks.input.set(Some(func));
+            }
+
+            // Keyboard-driven activation (Alt-Tab) generates no mouse events, so
+            // `Window::mouse_position` and the input modality still describe the
+            // state from before the window was deactivated, and hover styles are
+            // derived from that stale state until the next real WM_MOUSEMOVE.
+            // Synthesize a mouse move at the current cursor position so hover and
+            // hit-test state are correct immediately on activation.
+            let mut cursor = POINT::default();
+            if unsafe { GetCursorPos(&mut cursor) }.is_ok() {
+                let mut client_point = cursor;
+                if unsafe { ScreenToClient(handle, &mut client_point) }.as_bool() {
+                    let scale_factor = this.state.scale_factor.get();
+                    if let Some(mut func) = this.state.callbacks.input.take() {
+                        let input = PlatformInput::MouseMove(MouseMoveEvent {
+                            position: logical_point(
+                                client_point.x as f32,
+                                client_point.y as f32,
+                                scale_factor,
+                            ),
+                            pressed_button: None,
+                            modifiers: current_modifiers(),
+                        });
+                        func(input);
+                        this.state.callbacks.input.set(Some(func));
+                    }
+                }
             }
         }
 
