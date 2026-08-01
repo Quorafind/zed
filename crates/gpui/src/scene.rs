@@ -36,12 +36,54 @@ impl From<bool> for PaddedBool32 {
     }
 }
 
+/// Parameters of the black hole window post-process effect.
+///
+/// The effect is applied to the whole window after the regular UI scene has
+/// been rendered, distorting it as if it were seen through the gravitational
+/// field of a Schwarzschild black hole.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlackHolePostProcess {
+    /// Center of the black hole in normalized window coordinates, with a
+    /// top-left origin.
+    pub center: Point<f32>,
+    /// Radius of the black hole shadow, normalized to the window height.
+    pub radius: f32,
+    /// Animation time, in seconds.
+    pub time: f32,
+    /// How strongly the effect is blended over the untouched window contents,
+    /// in the `0.0..=1.0` range.
+    pub intensity: f32,
+}
+
+impl Default for BlackHolePostProcess {
+    fn default() -> Self {
+        Self {
+            center: point(0.5, 0.5),
+            radius: 0.08,
+            time: 0.0,
+            intensity: 1.0,
+        }
+    }
+}
+
+/// A post-process effect applied to the whole window once its scene has been
+/// rendered.
+///
+/// Only the Windows DirectX renderer honors this; the other platform renderers
+/// ignore it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WindowPostProcess {
+    /// See [`BlackHolePostProcess`].
+    BlackHole(BlackHolePostProcess),
+}
+
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
+    window_post_process: Option<WindowPostProcess>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -58,6 +100,7 @@ impl Scene {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
+        self.window_post_process = None;
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
@@ -70,6 +113,18 @@ impl Scene {
 
     pub fn len(&self) -> usize {
         self.paint_operations.len()
+    }
+
+    /// The post-process effect to run over the whole window once this scene
+    /// has been rendered, if any.
+    pub fn window_post_process(&self) -> Option<WindowPostProcess> {
+        self.window_post_process
+    }
+
+    /// Sets the post-process effect to run over the whole window once this
+    /// scene has been rendered. Passing `None` disables it.
+    pub fn set_window_post_process(&mut self, post_process: Option<WindowPostProcess>) {
+        self.window_post_process = post_process;
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
@@ -945,5 +1000,57 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_window_post_process_defaults_to_none() {
+        let scene = Scene::default();
+        assert_eq!(scene.window_post_process(), None);
+    }
+
+    #[test]
+    fn test_set_window_post_process_round_trips() {
+        let mut scene = Scene::default();
+        let effect = BlackHolePostProcess {
+            center: point(0.25, 0.75),
+            radius: 0.125,
+            time: 3.5,
+            intensity: 0.5,
+        };
+
+        scene.set_window_post_process(Some(WindowPostProcess::BlackHole(effect)));
+        assert_eq!(
+            scene.window_post_process(),
+            Some(WindowPostProcess::BlackHole(effect))
+        );
+
+        scene.set_window_post_process(None);
+        assert_eq!(scene.window_post_process(), None);
+    }
+
+    #[test]
+    fn test_clear_resets_window_post_process() {
+        let mut scene = Scene::default();
+        scene.set_window_post_process(Some(WindowPostProcess::BlackHole(
+            BlackHolePostProcess::default(),
+        )));
+        assert!(scene.window_post_process().is_some());
+
+        scene.clear();
+        assert_eq!(scene.window_post_process(), None);
+    }
+
+    #[test]
+    fn test_black_hole_post_process_default() {
+        let effect = BlackHolePostProcess::default();
+        assert_eq!(effect.center, point(0.5, 0.5));
+        assert_eq!(effect.time, 0.0);
+        assert_eq!(effect.intensity, 1.0);
+        assert!(effect.radius > 0.0);
     }
 }

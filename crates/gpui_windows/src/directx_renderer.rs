@@ -19,6 +19,7 @@ use windows::{
     core::{HSTRING, Interface},
 };
 
+use crate::black_hole_post_process::BlackHolePostProcessRenderer;
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use crate::*;
 use gpui::*;
@@ -42,6 +43,7 @@ pub(crate) struct DirectXRenderer {
     resources: Option<DirectXResources>,
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
+    black_hole_post_process: BlackHolePostProcessRenderer,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
 
@@ -168,6 +170,8 @@ impl DirectXRenderer {
             .context("Creating DirectX global elements")?;
         let pipelines = DirectXRenderPipelines::new(&devices.device)
             .context("Creating DirectX render pipelines")?;
+        let black_hole_post_process = BlackHolePostProcessRenderer::new(&devices.device)
+            .context("Creating black hole post-process renderer")?;
 
         let direct_composition = if disable_direct_composition {
             None
@@ -187,6 +191,7 @@ impl DirectXRenderer {
             resources: Some(resources),
             globals,
             pipelines,
+            black_hole_post_process,
             direct_composition,
             font_info: Self::get_font_info(),
             width: 1,
@@ -292,6 +297,8 @@ impl DirectXRenderer {
             .context("Creating DirectXGlobalElements")?;
         let pipelines = DirectXRenderPipelines::new(&devices.device)
             .context("Creating DirectXRenderPipelines")?;
+        let black_hole_post_process = BlackHolePostProcessRenderer::new(&devices.device)
+            .context("Creating black hole post-process renderer")?;
 
         let direct_composition = if disable_direct_composition {
             None
@@ -314,6 +321,7 @@ impl DirectXRenderer {
         self.resources = Some(resources);
         self.globals = globals;
         self.pipelines = pipelines;
+        self.black_hole_post_process = black_hole_post_process;
         self.direct_composition = direct_composition;
         self.skip_draws = true;
         Ok(())
@@ -380,6 +388,32 @@ impl DirectXRenderer {
                 )
             })?;
         }
+
+        // Window post-processing runs after the whole UI scene has been drawn,
+        // so it can distort the finished window as a single image.
+        if let Some(WindowPostProcess::BlackHole(effect)) = scene.window_post_process() {
+            let _annotation = annotation.as_ref().map(|annotation| {
+                Annotation::new(annotation, HSTRING::from("BlackHolePostProcess"))
+            });
+            let devices = self.devices.as_ref().context("devices missing")?;
+            let resources = self.resources.as_ref().context("resources missing")?;
+            self.black_hole_post_process
+                .draw(
+                    &devices.device,
+                    &devices.device_context,
+                    resources
+                        .render_target
+                        .as_ref()
+                        .context("render target missing")?,
+                    &resources.render_target_view,
+                    &resources.viewport,
+                    self.width,
+                    self.height,
+                    &effect,
+                )
+                .context("Drawing black hole post process")?;
+        }
+
         self.present()
     }
 
@@ -417,6 +451,7 @@ impl DirectXRenderer {
         }
 
         resources.recreate_resources(devices, width, height)?;
+        self.black_hole_post_process.reset_input();
 
         unsafe {
             devices
@@ -1632,6 +1667,7 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         EmojiRasterization,
+        BlackHolePostProcess,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1709,6 +1745,10 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
                 },
+                ShaderModule::BlackHolePostProcess => match target {
+                    ShaderTarget::Vertex => BLACK_HOLE_POST_PROCESS_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BLACK_HOLE_POST_PROCESS_FRAGMENT_BYTES,
+                },
             };
             Self { inner: bytes }
         }
@@ -1721,10 +1761,10 @@ pub(crate) mod shader_resources {
                 Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
             };
 
-            let shader_name = if matches!(entry, ShaderModule::EmojiRasterization) {
-                "color_text_raster.hlsl"
-            } else {
-                "shaders.hlsl"
+            let shader_name = match entry {
+                ShaderModule::EmojiRasterization => "color_text_raster.hlsl",
+                ShaderModule::BlackHolePostProcess => "black_hole_post_process.hlsl",
+                _ => "shaders.hlsl",
             };
 
             let entry = format!(
@@ -1796,6 +1836,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
+                ShaderModule::BlackHolePostProcess => "black_hole_post_process",
             }
         }
     }
