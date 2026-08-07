@@ -31,6 +31,9 @@ pub struct DecorationRun {
     /// The background color for this run
     pub background_color: Option<Hsla>,
 
+    /// The corner radius of the text background for this run
+    pub background_radius: Option<Pixels>,
+
     /// The underline style for this run
     pub underline: Option<UnderlineStyle>,
 
@@ -192,6 +195,7 @@ impl ShapedLine {
                     len: left_len,
                     color: decoration.color,
                     background_color: decoration.background_color,
+                    background_radius: decoration.background_radius,
                     underline: decoration.underline,
                     strikethrough: decoration.strikethrough,
                 });
@@ -199,6 +203,7 @@ impl ShapedLine {
                     len: right_len,
                     color: decoration.color,
                     background_color: decoration.background_color,
+                    background_radius: decoration.background_radius,
                     underline: decoration.underline,
                     strikethrough: decoration.strikethrough,
                 });
@@ -599,7 +604,7 @@ fn paint_line_background(
         let mut decoration_runs = decoration_runs.iter();
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
-        let mut current_background: Option<(Point<Pixels>, Hsla)> = None;
+        let mut current_background: Option<(Point<Pixels>, Hsla, Pixels)> = None;
         let text_system = cx.text_system().clone();
         let mut glyph_origin = point(
             aligned_origin_x(
@@ -622,18 +627,22 @@ fn paint_line_background(
 
                 if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
                     wraps.next();
-                    if let Some((background_origin, background_color)) = current_background.as_mut()
+                    if let Some((background_origin, background_color, background_radius)) =
+                        current_background.as_mut()
                     {
                         if glyph_origin.x == background_origin.x {
                             background_origin.x -= max_glyph_size.width.half()
                         }
-                        window.paint_quad(fill(
-                            Bounds {
-                                origin: *background_origin,
-                                size: size(glyph_origin.x - background_origin.x, line_height),
-                            },
-                            *background_color,
-                        ));
+                        window.paint_quad(
+                            fill(
+                                Bounds {
+                                    origin: *background_origin,
+                                    size: size(glyph_origin.x - background_origin.x, line_height),
+                                },
+                                *background_color,
+                            )
+                            .corner_radii(*background_radius),
+                        );
                         if glyph.index < run_end {
                             background_origin.x = origin.x;
                             background_origin.y += line_height;
@@ -654,7 +663,7 @@ fn paint_line_background(
                 }
                 prev_glyph_position = glyph.position;
 
-                let mut finished_background: Option<(Point<Pixels>, Hsla)> = None;
+                let mut finished_background: Option<(Point<Pixels>, Hsla, Pixels)> = None;
                 if glyph.index >= run_end {
                     let mut style_run = decoration_runs.next();
 
@@ -668,8 +677,11 @@ fn paint_line_background(
                     }
 
                     if let Some(style_run) = style_run {
-                        if let Some((_, background_color)) = &mut current_background
-                            && style_run.background_color.as_ref() != Some(background_color)
+                        if let Some((_, background_color, background_radius)) =
+                            &mut current_background
+                            && (style_run.background_color.as_ref() != Some(background_color)
+                                || style_run.background_radius.unwrap_or_default()
+                                    != *background_radius)
                         {
                             finished_background = current_background.take();
                         }
@@ -677,6 +689,7 @@ fn paint_line_background(
                             current_background.get_or_insert((
                                 point(glyph_origin.x, glyph_origin.y),
                                 run_background,
+                                style_run.background_radius.unwrap_or_default(),
                             ));
                         }
                         run_end += style_run.len as usize;
@@ -686,18 +699,23 @@ fn paint_line_background(
                     }
                 }
 
-                if let Some((mut background_origin, background_color)) = finished_background {
+                if let Some((mut background_origin, background_color, background_radius)) =
+                    finished_background
+                {
                     let mut width = glyph_origin.x - background_origin.x;
                     if background_origin.x == glyph_origin.x {
                         background_origin.x -= max_glyph_size.width.half();
                     };
-                    window.paint_quad(fill(
-                        Bounds {
-                            origin: background_origin,
-                            size: size(width, line_height),
-                        },
-                        background_color,
-                    ));
+                    window.paint_quad(
+                        fill(
+                            Bounds {
+                                origin: background_origin,
+                                size: size(width, line_height),
+                            },
+                            background_color,
+                        )
+                        .corner_radii(background_radius),
+                    );
                 }
             }
         }
@@ -709,17 +727,22 @@ fn paint_line_background(
             last_line_end_x -= glyph.position.x;
         }
 
-        if let Some((mut background_origin, background_color)) = current_background.take() {
+        if let Some((mut background_origin, background_color, background_radius)) =
+            current_background.take()
+        {
             if last_line_end_x == background_origin.x {
                 background_origin.x -= max_glyph_size.width.half()
             };
-            window.paint_quad(fill(
-                Bounds {
-                    origin: background_origin,
-                    size: size(last_line_end_x - background_origin.x, line_height),
-                },
-                background_color,
-            ));
+            window.paint_quad(
+                fill(
+                    Bounds {
+                        origin: background_origin,
+                        size: size(last_line_end_x - background_origin.x, line_height),
+                    },
+                    background_color,
+                )
+                .corner_radii(background_radius),
+            );
         }
 
         Ok(())
@@ -976,13 +999,15 @@ mod tests {
                     len: 2,
                     color: red,
                     background_color: None,
+                    background_radius: None,
                     underline: None,
                     strikethrough: None,
                 },
                 DecorationRun {
                     len: 3,
                     color: green,
-                    background_color: None,
+                    background_color: Some(green),
+                    background_radius: Some(px(4.)),
                     underline: None,
                     strikethrough: None,
                 },
@@ -990,6 +1015,7 @@ mod tests {
                     len: 1,
                     color: blue,
                     background_color: None,
+                    background_radius: None,
                     underline: None,
                     strikethrough: None,
                 },
@@ -1004,11 +1030,15 @@ mod tests {
         assert_eq!(left.decoration_runs[0].color, red);
         assert_eq!(left.decoration_runs[1].len, 1);
         assert_eq!(left.decoration_runs[1].color, green);
+        assert_eq!(left.decoration_runs[1].background_color, Some(green));
+        assert_eq!(left.decoration_runs[1].background_radius, Some(px(4.)));
 
         // Right: green(2) + blue(1) — green straddled, right portion has len 2
         assert_eq!(right.decoration_runs.len(), 2);
         assert_eq!(right.decoration_runs[0].len, 2);
         assert_eq!(right.decoration_runs[0].color, green);
+        assert_eq!(right.decoration_runs[0].background_color, Some(green));
+        assert_eq!(right.decoration_runs[0].background_radius, Some(px(4.)));
         assert_eq!(right.decoration_runs[1].len, 1);
         assert_eq!(right.decoration_runs[1].color, blue);
     }
