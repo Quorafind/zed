@@ -77,6 +77,10 @@ struct DirectWriteState {
     font_to_font_id: HashMap<Font, FontId>,
     font_info_cache: HashMap<usize, FontId>,
     layout_line_scratch: Vec<u16>,
+    /// Per-(font, size) line ascent/descent, measured once from an ASCII probe
+    /// layout. Keyed by the size's f32 bits — sizes arrive already quantized,
+    /// the key only has to be `Eq`.
+    line_metrics_cache: HashMap<(FontId, u32), (Pixels, Pixels)>,
 }
 
 impl GPUState {
@@ -214,6 +218,7 @@ impl DirectWriteTextSystem {
                 font_to_font_id: HashMap::default(),
                 font_info_cache: HashMap::default(),
                 layout_line_scratch: Vec::new(),
+                line_metrics_cache: HashMap::default(),
             }),
         })
     }
@@ -531,6 +536,8 @@ impl DirectWriteState {
 
             let mut utf8_offset = 0usize;
             let mut utf16_offset = 0u32;
+            let metrics_key = (font_runs[0].font_id, font_size.as_f32().to_bits());
+            let mut line_metrics = self.line_metrics_cache.get(&metrics_key).copied();
             let text_layout = {
                 let first_run = &font_runs[0];
                 let font_info = &self.fonts[first_run.font_id.0];
@@ -549,6 +556,33 @@ impl DirectWriteState {
                     .cast()?;
                 if let Some(ref fallbacks) = font_info.fallbacks {
                     format.SetFontFallback(fallbacks)?;
+                }
+
+                // Line ascent/descent come from a constant ASCII probe laid out
+                // with this same format, cached per (font, size) — not from the
+                // line's own content. DirectWrite reports metrics for the glyphs
+                // actually present, so a line drawn entirely from a CJK fallback
+                // font measures differently than its latin neighbours — and text
+                // whose content alternates between the two states (an IME preedit
+                // is latin; the hanzi it commits are not) visibly jumps its
+                // baseline on every keystroke.
+                if line_metrics.is_none() {
+                    let probe: [u16; 2] = [u16::from(b'M'), u16::from(b'g')];
+                    let probe_layout = components.factory.CreateTextLayout(
+                        &probe,
+                        &format,
+                        f32::INFINITY,
+                        f32::INFINITY,
+                    )?;
+                    let mut first_metrics = [DWRITE_LINE_METRICS::default(); 4];
+                    let mut line_count = 0u32;
+                    probe_layout.GetLineMetrics(Some(&mut first_metrics), &mut line_count)?;
+                    let measured = (
+                        px(first_metrics[0].baseline),
+                        px(first_metrics[0].height - first_metrics[0].baseline),
+                    );
+                    self.line_metrics_cache.insert(metrics_key, measured);
+                    line_metrics = Some(measured);
                 }
 
                 let layout = components.factory.CreateTextLayout(
@@ -570,15 +604,7 @@ impl DirectWriteState {
                 layout
             };
 
-            let (ascent, descent) = {
-                let mut first_metrics = [DWRITE_LINE_METRICS::default(); 4];
-                let mut line_count = 0u32;
-                text_layout.GetLineMetrics(Some(&mut first_metrics), &mut line_count)?;
-                (
-                    px(first_metrics[0].baseline),
-                    px(first_metrics[0].height - first_metrics[0].baseline),
-                )
-            };
+            let (ascent, descent) = line_metrics.expect("measured above on cache miss");
             let mut break_ligatures = true;
             for run in &font_runs[1..] {
                 let font_info = &self.fonts[run.font_id.0];
