@@ -3388,6 +3388,20 @@ impl Window {
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
         );
+        // Debug bounds (test-support) are keyed by selector, not paint index,
+        // so a reused subtree carries over every selector this frame's live
+        // paints have not (re-)recorded — otherwise a cached view's elements
+        // vanish from `debug_bounds` on exactly the frames that reuse them.
+        // A selector whose element genuinely left the tree this frame can
+        // linger with stale bounds; presence checks against cached subtrees
+        // matter more.
+        #[cfg(any(feature = "test-support", test))]
+        for (selector, bounds) in &self.rendered_frame.debug_bounds {
+            self.next_frame
+                .debug_bounds
+                .entry(selector.clone())
+                .or_insert(*bounds);
+        }
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
