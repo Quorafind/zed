@@ -1529,6 +1529,11 @@ impl WgpuRenderer {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    // Backdrop blur is implemented by the DirectX renderer.
+                    // The caller keeps a fill of its own behind the effect, so
+                    // dropping the batch leaves a plain panel rather than a
+                    // hole. See `BackdropBlur`.
+                    PrimitiveBatch::BackdropBlurs(_) => {}
                 }
             }
         }

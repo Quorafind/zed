@@ -731,6 +731,10 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                // Dropped, not drawn: the backdrop blur is implemented by the
+                // DirectX renderer, and the caller keeps a fill of its own
+                // behind the effect for exactly this case. See `BackdropBlur`.
+                PrimitiveBatch::BackdropBlurs(_) => {}
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
