@@ -15,6 +15,7 @@ use crate::{
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
+    BackdropBlur,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
@@ -4297,6 +4298,49 @@ impl Window {
         } else {
             vertical_band
         }
+    }
+
+    /// Blur whatever has already been painted beneath `bounds`, inside the
+    /// rounded rect, for the next frame at the current stacking context.
+    ///
+    /// This is the pane-of-glass primitive: content painted *before* this call
+    /// is what gets blurred, and content painted *after* it composites on top —
+    /// the relationship CSS `backdrop-filter` has with what is behind an
+    /// element. A panel therefore calls this first and then paints its own
+    /// tint and children over the result.
+    ///
+    /// Not every backend implements it. Where it is unsupported the call is
+    /// dropped, so a caller should keep a fill of its own rather than relying
+    /// on the blur to cover the region.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        sigma: Pixels,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = self.snap_bounds(bounds);
+        // A radius past half the shorter side makes the rounded-rect distance
+        // read every fragment as outside, and the whole region drops out.
+        let limit = bounds.size.width.min(bounds.size.height) / 2.;
+        let corner_radii = corner_radii.scale(scale_factor);
+        self.next_frame.scene.insert_primitive(BackdropBlur {
+            order: 0,
+            bounds,
+            content_mask: self.snapped_content_mask(),
+            corner_radii: Corners {
+                top_left: corner_radii.top_left.min(limit),
+                top_right: corner_radii.top_right.min(limit),
+                bottom_right: corner_radii.bottom_right.min(limit),
+                bottom_left: corner_radii.bottom_left.min(limit),
+            },
+            sigma: sigma.scale(scale_factor),
+        });
     }
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.

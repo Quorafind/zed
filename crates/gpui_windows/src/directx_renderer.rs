@@ -19,6 +19,7 @@ use windows::{
     core::{HSTRING, Interface},
 };
 
+use crate::backdrop_blur::BackdropBlurRenderer;
 use crate::black_hole_post_process::BlackHolePostProcessRenderer;
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use crate::*;
@@ -45,6 +46,7 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     black_hole_post_process: BlackHolePostProcessRenderer,
+    backdrop_blur: BackdropBlurRenderer,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
 
@@ -172,6 +174,8 @@ impl DirectXRenderer {
             .context("Creating DirectX global elements")?;
         let pipelines = DirectXRenderPipelines::new(&devices.device)
             .context("Creating DirectX render pipelines")?;
+        let backdrop_blur = BackdropBlurRenderer::new(&devices.device)
+            .context("Creating backdrop blur renderer")?;
         let black_hole_post_process = BlackHolePostProcessRenderer::new(&devices.device)
             .context("Creating black hole post-process renderer")?;
 
@@ -193,6 +197,7 @@ impl DirectXRenderer {
             resources: Some(resources),
             globals,
             pipelines,
+            backdrop_blur,
             black_hole_post_process,
             direct_composition,
             font_info: Self::get_font_info(),
@@ -305,6 +310,8 @@ impl DirectXRenderer {
             .context("Creating DirectXGlobalElements")?;
         let pipelines = DirectXRenderPipelines::new(&devices.device)
             .context("Creating DirectXRenderPipelines")?;
+        let backdrop_blur = BackdropBlurRenderer::new(&devices.device)
+            .context("Creating backdrop blur renderer")?;
         let black_hole_post_process = BlackHolePostProcessRenderer::new(&devices.device)
             .context("Creating black hole post-process renderer")?;
 
@@ -329,6 +336,7 @@ impl DirectXRenderer {
         self.resources = Some(resources);
         self.globals = globals;
         self.pipelines = pipelines;
+        self.backdrop_blur = backdrop_blur;
         self.black_hole_post_process = black_hole_post_process;
         self.direct_composition = direct_composition;
         self.skip_draws = true;
@@ -375,6 +383,12 @@ impl DirectXRenderer {
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
             match batch {
+                // Breaks the pass rather than drawing in it: the snapshot it
+                // reads has to hold every batch before this point and none
+                // after.
+                PrimitiveBatch::BackdropBlurs(range) => {
+                    self.draw_backdrop_blurs(&scene.backdrop_blurs[range])
+                }
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
@@ -516,6 +530,29 @@ impl DirectXRenderer {
             .context("Failed to build RgbaImage from staging readback")
     }
 
+    /// Resolve each backdrop blur in this batch against the target as it
+    /// currently stands.
+    fn draw_backdrop_blurs(&mut self, blurs: &[gpui::BackdropBlur]) -> Result<()> {
+        for blur in blurs {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            let resources = self.resources.as_ref().context("resources missing")?;
+            self.backdrop_blur.draw(
+                &devices.device,
+                &devices.device_context,
+                resources
+                    .render_target
+                    .as_ref()
+                    .context("render target missing")?,
+                &resources.render_target_view,
+                &resources.viewport,
+                self.width,
+                self.height,
+                blur,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
         let width = new_size.width.0.max(1) as u32;
         let height = new_size.height.0.max(1) as u32;
@@ -550,6 +587,7 @@ impl DirectXRenderer {
         }
 
         resources.recreate_resources(devices, width, height)?;
+        self.backdrop_blur.reset_input();
         self.black_hole_post_process.reset_input();
 
         unsafe {
@@ -1747,6 +1785,7 @@ pub(crate) mod shader_resources {
         PolychromeSprite,
         EmojiRasterization,
         BlackHolePostProcess,
+        BackdropBlur,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1828,6 +1867,10 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => BLACK_HOLE_POST_PROCESS_VERTEX_BYTES,
                     ShaderTarget::Fragment => BLACK_HOLE_POST_PROCESS_FRAGMENT_BYTES,
                 },
+                ShaderModule::BackdropBlur => match target {
+                    ShaderTarget::Vertex => BACKDROP_BLUR_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_BLUR_FRAGMENT_BYTES,
+                },
             };
             Self { inner: bytes }
         }
@@ -1843,6 +1886,7 @@ pub(crate) mod shader_resources {
             let shader_name = match entry {
                 ShaderModule::EmojiRasterization => "color_text_raster.hlsl",
                 ShaderModule::BlackHolePostProcess => "black_hole_post_process.hlsl",
+                ShaderModule::BackdropBlur => "backdrop_blur.hlsl",
                 _ => "shaders.hlsl",
             };
 
@@ -1916,6 +1960,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
                 ShaderModule::BlackHolePostProcess => "black_hole_post_process",
+                ShaderModule::BackdropBlur => "backdrop_blur",
             }
         }
     }
@@ -2103,3 +2148,4 @@ mod dxgi {
         ))
     }
 }
+

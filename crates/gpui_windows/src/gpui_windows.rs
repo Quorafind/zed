@@ -1,5 +1,6 @@
 #![cfg(target_os = "windows")]
 
+mod backdrop_blur;
 mod black_hole_post_process;
 mod clipboard;
 mod destination_list;

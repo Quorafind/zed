@@ -84,6 +84,9 @@ pub struct Scene {
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
     window_post_process: Option<WindowPostProcess>,
+    /// Kept separate from the drawable primitives: each one breaks the render
+    /// pass rather than being drawn in it. See [`BackdropBlur`].
+    pub backdrop_blurs: Vec<BackdropBlur>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -101,6 +104,7 @@ impl Scene {
         self.primitive_bounds.clear();
         self.layer_stack.clear();
         self.window_post_process = None;
+        self.backdrop_blurs.clear();
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
@@ -155,6 +159,10 @@ impl Scene {
             .copied()
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
         match &mut primitive {
+            Primitive::BackdropBlur(blur) => {
+                blur.order = order;
+                self.backdrop_blurs.push(*blur);
+            }
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
                 self.shadows.push(*shadow);
@@ -204,6 +212,7 @@ impl Scene {
     }
 
     pub fn finish(&mut self) {
+        self.backdrop_blurs.sort_by_key(|blur| blur.order);
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
@@ -226,6 +235,8 @@ impl Scene {
     )]
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
         BatchIterator {
+            backdrop_blurs_start: 0,
+            backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
             shadows_start: 0,
             shadows_iter: self.shadows.iter().peekable(),
             quads_start: 0,
@@ -255,6 +266,9 @@ impl Scene {
     allow(dead_code)
 )]
 pub(crate) enum PrimitiveKind {
+    /// Ordered ahead of every drawable kind: at equal order the backdrop has to
+    /// be resolved before anything paints over it.
+    BackdropBlur,
     Shadow,
     #[default]
     Quad,
@@ -275,6 +289,7 @@ pub(crate) enum PaintOperation {
 #[derive(Clone)]
 #[expect(missing_docs)]
 pub enum Primitive {
+    BackdropBlur(BackdropBlur),
     Shadow(Shadow),
     Quad(Quad),
     Path(Path<ScaledPixels>),
@@ -289,6 +304,7 @@ pub enum Primitive {
 impl Primitive {
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
+            Primitive::BackdropBlur(blur) => &blur.bounds,
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::Quad(quad) => &quad.bounds,
             Primitive::Path(path) => &path.bounds,
@@ -302,6 +318,7 @@ impl Primitive {
 
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
         match self {
+            Primitive::BackdropBlur(blur) => &blur.content_mask,
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
             Primitive::Path(path) => &path.content_mask,
@@ -322,6 +339,8 @@ impl Primitive {
     allow(dead_code)
 )]
 struct BatchIterator<'a> {
+    backdrop_blurs_start: usize,
+    backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
     shadows_start: usize,
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
     quads_start: usize,
@@ -345,6 +364,10 @@ impl<'a> Iterator for BatchIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
+            (
+                self.backdrop_blurs_iter.peek().map(|b| b.order),
+                PrimitiveKind::BackdropBlur,
+            ),
             (
                 self.shadows_iter.peek().map(|s| s.order),
                 PrimitiveKind::Shadow,
@@ -383,6 +406,15 @@ impl<'a> Iterator for BatchIterator<'a> {
         };
 
         match batch_kind {
+            // One per batch, never coalesced: each blur has to read a target
+            // that already holds every earlier batch, so two of them cannot
+            // share a pass even at the same order.
+            PrimitiveKind::BackdropBlur => {
+                let start = self.backdrop_blurs_start;
+                self.backdrop_blurs_iter.next();
+                self.backdrop_blurs_start = start + 1;
+                Some(PrimitiveBatch::BackdropBlurs(start..start + 1))
+            }
             PrimitiveKind::Shadow => {
                 let shadows_start = self.shadows_start;
                 let mut shadows_end = shadows_start + 1;
@@ -530,6 +562,7 @@ impl<'a> Iterator for BatchIterator<'a> {
 )]
 #[allow(missing_docs)]
 pub enum PrimitiveBatch {
+    BackdropBlurs(Range<usize>),
     Shadows(Range<usize>),
     Quads(Range<usize>),
     Paths(Range<usize>),
@@ -554,6 +587,7 @@ impl PrimitiveBatch {
     #[expect(missing_docs)]
     pub fn label(&self) -> String {
         match self {
+            Self::BackdropBlurs(range) => format!("backdrop blurs ({})", range.len()),
             Self::Shadows(range) => format!("shadows ({})", range.len()),
             Self::Quads(range) => format!("quads ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),
@@ -581,6 +615,35 @@ impl PrimitiveBatch {
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
         }
+    }
+}
+
+/// A request to blur whatever has already been painted beneath `bounds`.
+///
+/// This is not drawn like the other primitives. The renderer snapshots the
+/// target where this lands in the order, blurs the snapshot inside the rounded
+/// rect and writes it back, so everything painted afterwards composites on top
+/// — the same relationship CSS `backdrop-filter` has with the elements behind
+/// it. A backend without the capability may skip it, so a caller keeps a fill
+/// of its own behind the effect.
+#[derive(Default, Debug, Copy, Clone)]
+#[repr(C)]
+pub struct BackdropBlur {
+    /// Where this sits in paint order — what "already painted" means for it.
+    pub order: DrawOrder,
+    /// The region to resolve, in scaled pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The clip in force where this was requested.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Corners the effect is cut to, matching the panel that requested it.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Gaussian sigma, in scaled pixels.
+    pub sigma: ScaledPixels,
+}
+
+impl From<BackdropBlur> for Primitive {
+    fn from(blur: BackdropBlur) -> Self {
+        Primitive::BackdropBlur(blur)
     }
 }
 
