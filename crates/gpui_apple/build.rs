@@ -55,6 +55,8 @@ mod macos_build {
             "UnderlineInputIndex".into(),
             "Quad".into(),
             "BorderStyle".into(),
+            "BackdropBlur".into(),
+            "BackdropBlurInputIndex".into(),
             "SpriteInputIndex".into(),
             "MonochromeSprite".into(),
             "PolychromeSprite".into(),

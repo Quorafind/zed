@@ -899,6 +899,66 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   return ycbcrToRGBTransform * ycbcr;
 }
 
+struct BackdropBlurVertexOutput {
+  uint blur_id [[flat]];
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BackdropBlurFragmentInput {
+  uint blur_id [[flat]];
+  float4 position [[position]];
+};
+
+vertex BackdropBlurVertexOutput backdrop_blur_vertex(
+    uint unit_vertex_id [[vertex_id]], uint blur_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
+    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropBlurInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  BackdropBlur blur = blurs[blur_id];
+  float4 device_position =
+      to_device_position(unit_vertex, blur.bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, blur.bounds,
+                                                 blur.content_mask.bounds);
+  return BackdropBlurVertexOutput{
+      blur_id,
+      device_position,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+// The pane-of-glass pass. The renderer has already snapshotted what the frame
+// holds so far and run a gaussian over the pane's pixels; this writes that
+// back inside the rounded rect, so everything painted afterwards composites
+// on top — the relationship CSS `backdrop-filter` has with the elements
+// behind an element, which is what makes a panel blur what is *behind* it
+// rather than itself.
+fragment float4 backdrop_blur_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropBlurInputIndex_ViewportSize)]],
+    texture2d<float> blurred [[texture(BackdropBlurInputIndex_Blurred)]]) {
+  BackdropBlur blur = blurs[input.blur_id];
+  float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
+  // One pixel of feather so the corner is antialiased rather than stepped.
+  float coverage = saturate(0.5 - distance);
+  if (coverage <= 0.) {
+    return float4(0.);
+  }
+
+  constexpr sampler blurred_sampler(mag_filter::linear, min_filter::linear,
+                                    address::clamp_to_edge);
+  float2 uv = input.position.xy / float2((float)viewport_size->width,
+                                         (float)viewport_size->height);
+  float4 sample = blurred.sample(blurred_sampler, uv);
+  // The pipeline blends by source alpha: the feather is the alpha, and inside
+  // the rect the blur replaces what was there. The caller's own tint is a
+  // separate quad painted after this one.
+  return float4(sample.rgb, coverage);
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;

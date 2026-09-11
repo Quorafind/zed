@@ -7,8 +7,8 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, PaintSurface,
+    Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -22,8 +22,12 @@ use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
     CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
 };
-use objc::{self, msg_send, sel, sel_impl};
+use objc::{self, class, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
+
+// `MPSImageGaussianBlur`, for the backdrop blur — see [`GaussianKernel`].
+#[link(name = "MetalPerformanceShaders", kind = "framework")]
+unsafe extern "C" {}
 
 use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
 
@@ -126,6 +130,7 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    backdrop_blurs_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -134,6 +139,12 @@ pub struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
+    /// The backdrop blur's two viewport-sized textures: the snapshot of the
+    /// target, and the gaussian of it — see [`Self::backdrop_textures`].
+    backdrop_scratch: Option<metal::Texture>,
+    backdrop_blurred: Option<metal::Texture>,
+    /// One `MPSImageGaussianBlur` per sigma the scene asks for.
+    backdrop_kernels: Vec<(f32, GaussianKernel)>,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -160,8 +171,10 @@ impl MetalRenderer {
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
         layer.set_maximum_drawable_count(3);
-        // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
-        #[cfg(any(test, feature = "test-support"))]
+        // The drawable is read back as well as drawn into: the backdrop blur
+        // snapshots it mid-frame, and a framebuffer-only texture cannot be a
+        // blit source. (Visual tests read it for screenshots, which is why
+        // this used to be test-only.)
         layer.set_framebuffer_only(false);
         unsafe {
             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
@@ -323,6 +336,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let backdrop_blurs_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "backdrop_blurs",
+            "backdrop_blur_vertex",
+            "backdrop_blur_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -345,6 +366,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            backdrop_blurs_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -352,6 +374,9 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            backdrop_scratch: None,
+            backdrop_blurred: None,
+            backdrop_kernels: Vec::new(),
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
         }
@@ -731,10 +756,26 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
-                // Dropped, not drawn: the backdrop blur is implemented by the
-                // DirectX renderer, and the caller keeps a fill of its own
-                // behind the effect for exactly this case. See `BackdropBlur`.
-                PrimitiveBatch::BackdropBlurs(_) => {}
+                PrimitiveBatch::BackdropBlurs(range) => {
+                    // Each blur reads the target as it stands, so the pass
+                    // has to end before the copy and restart after the
+                    // write-back — the same break the path batch makes.
+                    command_encoder.end_encoding();
+                    self.draw_backdrop_blurs(
+                        &scene.backdrop_blurs[range.clone()],
+                        range.start,
+                        instance_bindings,
+                        texture,
+                        viewport_size,
+                        command_buffer,
+                    );
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        texture,
+                        viewport_size,
+                        None,
+                    );
+                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
@@ -742,6 +783,156 @@ impl MetalRenderer {
         command_encoder.end_encoding();
 
         Ok(command_buffer.to_owned())
+    }
+
+    /// Resolve each blur in this batch against the target as it stands when
+    /// the blur's turn comes: a card on a surface blurs the surface's own
+    /// blur, not the wallpaper under both. See [`BackdropBlur`].
+    fn draw_backdrop_blurs(
+        &mut self,
+        blurs: &[BackdropBlur],
+        first_instance: usize,
+        instance_bindings: &InstanceBindings,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+    ) {
+        if blurs.is_empty() {
+            return;
+        }
+        let (scratch, blurred) = self.backdrop_textures(texture);
+        let whole = metal::MTLSize {
+            width: texture.width(),
+            height: texture.height(),
+            depth: 1,
+        };
+
+        for (index, blur) in blurs.iter().enumerate() {
+            let Some(region) = backdrop_region(blur, texture) else {
+                continue;
+            };
+            // Snapshot the target as it stands. Whole rather than the pane's
+            // neighbourhood: the copy is a fraction of the gaussian's cost,
+            // and a partial copy would leave the kernel reading last frame's
+            // pixels wherever its reach crossed the copied edge.
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.copy_from_texture(
+                texture,
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                whole,
+                &scratch,
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+            blit.end_encoding();
+            // The gaussian itself is Apple's, written only inside the pane: a
+            // hand-rolled grid of sparse taps ghosts on text at any sigma
+            // worth having, and a true kernel over the whole window would be
+            // a full-screen pass per pane.
+            self.gaussian_kernel(blur.sigma.0)
+                .encode(command_buffer, &scratch, &blurred, region);
+
+            let command_encoder =
+                new_command_encoder_for_texture(command_buffer, texture, viewport_size, None);
+            command_encoder.set_render_pipeline_state(&self.backdrop_blurs_pipeline_state);
+            command_encoder.set_vertex_buffer(
+                BackdropBlurInputIndex::Vertices as u64,
+                Some(&self.unit_vertices),
+                0,
+            );
+            command_encoder.set_vertex_buffer(
+                BackdropBlurInputIndex::Blurs as u64,
+                Some(&instance_bindings.backdrop_blurs.buffer),
+                instance_bindings.backdrop_blurs.offset as u64,
+            );
+            command_encoder.set_vertex_bytes(
+                BackdropBlurInputIndex::ViewportSize as u64,
+                mem::size_of_val(&viewport_size) as u64,
+                &viewport_size as *const Size<DevicePixels> as *const _,
+            );
+            command_encoder.set_fragment_buffer(
+                BackdropBlurInputIndex::Blurs as u64,
+                Some(&instance_bindings.backdrop_blurs.buffer),
+                instance_bindings.backdrop_blurs.offset as u64,
+            );
+            command_encoder.set_fragment_bytes(
+                BackdropBlurInputIndex::ViewportSize as u64,
+                mem::size_of_val(&viewport_size) as u64,
+                &viewport_size as *const Size<DevicePixels> as *const _,
+            );
+            command_encoder
+                .set_fragment_texture(BackdropBlurInputIndex::Blurred as u64, Some(&blurred));
+            command_encoder.draw_primitives_instanced_base_instance(
+                metal::MTLPrimitiveType::Triangle,
+                0,
+                6,
+                1,
+                (first_instance + index) as u64,
+            );
+            command_encoder.end_encoding();
+        }
+    }
+
+    /// The backdrop blur's `(snapshot, blurred)` pair, matching the target's
+    /// size and format so a blur's pixel coordinates address both directly.
+    /// Rebuilt whenever the target changes shape under them.
+    fn backdrop_textures(
+        &mut self,
+        target: &metal::TextureRef,
+    ) -> (metal::Texture, metal::Texture) {
+        let (width, height, format) = (target.width(), target.height(), target.pixel_format());
+        let stale = self.backdrop_scratch.as_ref().is_none_or(|scratch| {
+            scratch.width() != width
+                || scratch.height() != height
+                || scratch.pixel_format() != format
+        });
+        if stale {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(width);
+            descriptor.set_height(height);
+            descriptor.set_pixel_format(format);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+            self.backdrop_scratch = Some(self.device.new_texture(&descriptor));
+            // The gaussian writes through a compute kernel.
+            descriptor.set_usage(
+                metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::ShaderWrite,
+            );
+            self.backdrop_blurred = Some(self.device.new_texture(&descriptor));
+        }
+        (
+            self.backdrop_scratch
+                .clone()
+                .expect("the snapshot texture was created above"),
+            self.backdrop_blurred
+                .clone()
+                .expect("the blurred texture was created above"),
+        )
+    }
+
+    /// The gaussian kernel for `sigma`, in device pixels. A scene asks for a
+    /// handful of sigmas — one per depth of glass — and a kernel is not free
+    /// to build, so each is kept; the set is dropped whole if a slider walks
+    /// it past any reasonable size.
+    fn gaussian_kernel(&mut self, sigma: f32) -> &GaussianKernel {
+        const KEPT_KERNELS: usize = 16;
+        let sigma = sigma.max(1e-3);
+        let index = self
+            .backdrop_kernels
+            .iter()
+            .position(|(kept, _)| (kept - sigma).abs() < 1e-3)
+            .unwrap_or_else(|| {
+                if self.backdrop_kernels.len() >= KEPT_KERNELS {
+                    self.backdrop_kernels.clear();
+                }
+                self.backdrop_kernels
+                    .push((sigma, GaussianKernel::new(&self.device, sigma)));
+                self.backdrop_kernels.len() - 1
+            });
+        &self.backdrop_kernels[index].1
     }
 
     fn draw_paths_to_intermediate(
@@ -1240,6 +1431,85 @@ fn new_command_encoder_for_texture<'a>(
     command_encoder
 }
 
+/// The pixels of the target a blur rewrites: its bounds, clamped to the
+/// target. `None` when nothing of it is on screen.
+fn backdrop_region(blur: &BackdropBlur, target: &metal::TextureRef) -> Option<metal::MTLRegion> {
+    let left = blur.bounds.origin.x.0.floor().max(0.);
+    let top = blur.bounds.origin.y.0.floor().max(0.);
+    let right = (blur.bounds.origin.x.0 + blur.bounds.size.width.0)
+        .ceil()
+        .min(target.width() as f32);
+    let bottom = (blur.bounds.origin.y.0 + blur.bounds.size.height.0)
+        .ceil()
+        .min(target.height() as f32);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(metal::MTLRegion {
+        origin: metal::MTLOrigin {
+            x: left as u64,
+            y: top as u64,
+            z: 0,
+        },
+        size: metal::MTLSize {
+            width: (right - left) as u64,
+            height: (bottom - top) as u64,
+            depth: 1,
+        },
+    })
+}
+
+/// An `MPSImageGaussianBlur` — Apple's separable gaussian, exact at any
+/// sigma. Owned: the object is released with the kernel.
+struct GaussianKernel(*mut objc::runtime::Object);
+
+impl GaussianKernel {
+    fn new(device: &metal::DeviceRef, sigma: f32) -> Self {
+        let kernel: *mut objc::runtime::Object = unsafe {
+            let alloc: *mut objc::runtime::Object = msg_send![class!(MPSImageGaussianBlur), alloc];
+            let kernel: *mut objc::runtime::Object = msg_send![
+                alloc,
+                initWithDevice: device.as_ptr() as *mut objc::runtime::Object
+                sigma: sigma
+            ];
+            // MPSImageEdgeModeClamp. The default treats everything past the
+            // texture as transparent black, which bleeds a dark vignette into
+            // every pane that touches the window's edge.
+            let _: () = msg_send![kernel, setEdgeMode: 1u64];
+            kernel
+        };
+        Self(kernel)
+    }
+
+    /// Blur `source` into `destination`, writing only inside `region`. The
+    /// kernel reads past it as far as its sigma reaches.
+    fn encode(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        source: &metal::TextureRef,
+        destination: &metal::TextureRef,
+        region: metal::MTLRegion,
+    ) {
+        unsafe {
+            let _: () = msg_send![self.0, setClipRect: region];
+            let _: () = msg_send![
+                self.0,
+                encodeToCommandBuffer: command_buffer.as_ptr() as *mut objc::runtime::Object
+                sourceTexture: source.as_ptr() as *mut objc::runtime::Object
+                destinationTexture: destination.as_ptr() as *mut objc::runtime::Object
+            ];
+        }
+    }
+}
+
+impl Drop for GaussianKernel {
+    fn drop(&mut self) {
+        unsafe {
+            let _: () = msg_send![self.0, release];
+        }
+    }
+}
+
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
     let width = texture.width() as u32;
@@ -1390,11 +1660,13 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
     surfaces: InstanceBinding,
+    backdrop_blurs: InstanceBinding,
 }
 
 fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
     Ok(InstanceBindings {
         quads: writer.write(&scene.quads)?,
+        backdrop_blurs: writer.write(&scene.backdrop_blurs)?,
         shadows: writer.write(&scene.shadows)?,
         underlines: writer.write(&scene.underlines)?,
         monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
@@ -1575,6 +1847,14 @@ enum SurfaceInputIndex {
     TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
+}
+
+#[repr(C)]
+enum BackdropBlurInputIndex {
+    Vertices = 0,
+    Blurs = 1,
+    ViewportSize = 2,
+    Blurred = 3,
 }
 
 #[repr(C)]
